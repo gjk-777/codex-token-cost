@@ -19,7 +19,7 @@
 
 Codex Token Cost 是一个面向 [Codex++](https://github.com/BigPizzaV3/CodexPlusPlus) 的本地 userscript。它在 Codex 输入区上方展示本轮、当前会话、缓存命中、费用和今日累计，并提供独立使用统计、模型价格管理及本地 Profile 数据。
 
-主脚本可独立运行。可选 helper 仅用于桥接 CC Switch；Profile activity 始终以 userscript 本地 ledger 为准。
+主脚本可独立运行。可选 helper 用于桥接 CC Switch，并增量读取 `~/.codex/sessions`，将 Codex 桌面端和 VS Code Codex 插件的本地会话统计合并到 userscript Profile ledger。Codex++ 仍是统一展示端，并继续记录自身的实时数据。
 
 ## 核心能力
 
@@ -30,6 +30,7 @@ Codex Token Cost 是一个面向 [Codex++](https://github.com/BigPizzaV3/CodexPl
 | 本地 Profile | 解锁 Codex Profile，并使用本地 Profile ledger 替代不可用的云端资料 |
 | 模型定价 | 按 USD / 1M tokens 管理输入、读缓存、写缓存和输出价格 |
 | CC Switch 同步 | 通过可选 helper 合并 CC Switch 历史与近期小时趋势，不覆盖本地 Profile activity |
+| 多端 Codex 汇总 | 通过可选 helper 汇总 Codex++、Codex 桌面端与 VS Code Codex 插件的 Token、会话及调用活动 |
 | 本地优先 | usage、价格和 Profile 配置保存在本机，不上传项目内容或认证信息 |
 
 ## 功能展示
@@ -70,6 +71,7 @@ flowchart LR
   C --> E[使用统计]
   C --> F[本地 Profile]
   G[CC Switch SQLite] --> H[可选 helper]
+  I[Codex sessions JSONL] --> H
   H --> B
 ```
 
@@ -91,12 +93,13 @@ sh ./scripts/deploy-userscript.sh
 
 ## 可选 helper
 
-helper 默认监听 `127.0.0.1:17888`，只读取 CC Switch SQLite。不开启 helper 时，实时 HUD、本地 ledger、使用统计和 Profile 仍然可用。
+helper 默认监听 `127.0.0.1:17888`，读取 CC Switch SQLite 与 `~/.codex/sessions`。不开启 helper 时，实时 HUD、本地 ledger、使用统计和 Profile 仍然可用，但不会合并其他 Codex 客户端的数据。
 
 | helper 能力 | 未启动时 |
 |---|---|
 | CC Switch 同步 | 不可用 |
-| Profile activity、duration、fast mode、skill / plugin | 使用本地 Profile ledger，正常工作 |
+| Codex 桌面端、VS Code 历史汇总 | 不可用 |
+| 当前 Codex++ activity、duration、fast mode、skill / plugin | 使用本地 Profile ledger，正常工作 |
 | HUD 与使用统计 | 正常工作 |
 
 ### 手动启动
@@ -220,5 +223,5 @@ tests/
 ## 隐私
 
 - 主脚本写入 Codex WebView 的 `localStorage`，并在可用时使用 IndexedDB 保存 Profile ledger。
-- helper 只读取本机 CC Switch SQLite 数据。
+- helper 只读取本机 CC Switch SQLite 与 `~/.codex/sessions`，会话日志解析结果只保留统计字段，不保存对话正文。
 - 仓库不保存 API key、cookie、session token 或真实云端账号 ID。

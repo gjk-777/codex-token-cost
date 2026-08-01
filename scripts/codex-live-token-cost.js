@@ -80,6 +80,8 @@ const VERSION = "0.7.9";
   const PROFILE_SAVE_STATUS_DURATION_MS = 1800;
   const CC_SWITCH_TURNS_URL = "http://127.0.0.1:17888/cc-switch/turns";
   const CC_SWITCH_TURNS_REFRESH_URL = `${CC_SWITCH_TURNS_URL}?refresh=1`;
+  const CODEX_SESSION_TURNS_URL = "http://127.0.0.1:17888/codex-sessions/turns";
+  const CODEX_SESSION_TURNS_REFRESH_URL = `${CODEX_SESSION_TURNS_URL}?refresh=1`;
   const PROFILE_DATA_REFRESH_MIN_INTERVAL_MS = 60000;
   const HELPER_REFRESH_POLL_INTERVAL_MS = 500;
   const HELPER_REFRESH_MAX_POLLS = 60;
@@ -331,6 +333,8 @@ const VERSION = "0.7.9";
     ccSwitchSyncInFlight: false,
     ccSwitchSyncPromise: null,
     ccSwitchSyncGeneration: 0,
+    codexSessionSyncInFlight: false,
+    codexSessionSyncPromise: null,
     ccSwitchStartupSyncStarted: false,
     ccSwitchSyncStatus: "",
     settingsStatusPulseFrame: 0,
@@ -464,6 +468,12 @@ const VERSION = "0.7.9";
     return source === "cc-switch" || importSource === "cc-switch";
   }
 
+  function countsTowardProfileFastMode(turn) {
+    const source = normalizeText(turn?.source, 80);
+    const importSource = normalizeText(turn?.importSource, 80);
+    return (source !== "codex-session" && importSource !== "codex-session") || typeof turn?.fastMode === "boolean";
+  }
+
   function profileDurationRank(status) {
     return status === "completed" ? 3 : status === "recovered" ? 2 : 1;
   }
@@ -502,6 +512,7 @@ const VERSION = "0.7.9";
       effort: normalizeReasoningEffort(raw.effort || raw.reasoningEffort),
       callCount: Math.max(0, toCount(raw.callCount ?? raw.call_count)),
       source: normalizeText(raw.source, 80) || "codex-live-token-cost",
+      importSource: normalizeText(raw.importSource, 80),
       capturedAt: profileTimestampIso(raw.capturedAt || raw.captured_at || raw.observedAt || raw.observed_at, new Date().toISOString()),
       persistReason: normalizeText(raw.persistReason || raw.persist_reason, 80) || "observed",
       invocationIds: Array.from(new Set((Array.isArray(raw.invocationIds) ? raw.invocationIds : []).map((id) => normalizeText(id, 240)).filter(Boolean))),
@@ -946,19 +957,6 @@ const VERSION = "0.7.9";
         rollup.activity.longestObservedDurationMs = Math.max(rollup.activity.longestObservedDurationMs, durationMs);
         if (turn.durationStatus === "completed") rollup.activity.longestCompletedDurationMs = Math.max(rollup.activity.longestCompletedDurationMs, durationMs);
       }
-      if (!usage.exact || !toCount(usage.total || usage.input + usage.output)) continue;
-      const cost = turnCost(turn, turn.model).value;
-      profileAddBucket(isCcSwitchProfileTurn(turn) ? day.ccSwitch : day.local, turn, usage, cost);
-      if (isCcSwitchProfileTurn(turn)) continue;
-      day.totalTurns += 1;
-      day.totalTokens += toCount(usage.total || usage.input + usage.output);
-      if (turn.fastMode === true) {
-        day.fastModeTokens += toCount(usage.total || usage.input + usage.output);
-        day.fastModeTurns += 1;
-      }
-      const effort = normalizeReasoningEffort(turn.effort);
-      if (effort) day.reasoningEffort[effort] = toCount(day.reasoningEffort[effort]) + 1;
-      if (turn.threadAttributionStatus === "reliable" && turn.threadKey && !isTransientSessionKey(turn.threadKey)) threadKeys.add(turn.threadKey);
       const invocationIds = Array.isArray(turn.invocationIds) ? turn.invocationIds : [];
       for (const invocationId of invocationIds) {
         const invocation = ledger.invocations[invocationId];
@@ -971,12 +969,30 @@ const VERSION = "0.7.9";
         dayCurrent.count += toCount(invocation.occurrence) || 1;
         day.invocationCounts[key] = dayCurrent;
       }
+      if (!usage.exact || !toCount(usage.total || usage.input + usage.output)) continue;
+      const cost = turnCost(turn, turn.model).value;
+      profileAddBucket(isCcSwitchProfileTurn(turn) ? day.ccSwitch : day.local, turn, usage, cost);
+      if (isCcSwitchProfileTurn(turn)) continue;
+      day.totalTurns += 1;
+      const fastModeUsageTokens = toCount(usage.total || usage.input + usage.output);
+      if (countsTowardProfileFastMode(turn)) {
+        day.totalTokens += fastModeUsageTokens;
+        if (turn.fastMode === true) {
+          day.fastModeTokens += fastModeUsageTokens;
+          day.fastModeTurns += 1;
+        }
+      }
+      const effort = normalizeReasoningEffort(turn.effort);
+      if (effort) day.reasoningEffort[effort] = toCount(day.reasoningEffort[effort]) + 1;
+      if (turn.threadAttributionStatus === "reliable" && turn.threadKey && !isTransientSessionKey(turn.threadKey)) threadKeys.add(turn.threadKey);
       if (effort) rollup.activity.effortCounts[effort] = toCount(rollup.activity.effortCounts[effort]) + 1;
       rollup.activity.totalTurns += 1;
-      rollup.activity.totalTokens += toCount(usage.total || usage.input + usage.output);
-      if (turn.fastMode === true) {
-        rollup.activity.fastModeTokens += toCount(usage.total || usage.input + usage.output);
-        rollup.activity.fastModeTurns += 1;
+      if (countsTowardProfileFastMode(turn)) {
+        rollup.activity.totalTokens += fastModeUsageTokens;
+        if (turn.fastMode === true) {
+          rollup.activity.fastModeTokens += fastModeUsageTokens;
+          rollup.activity.fastModeTurns += 1;
+        }
       }
     }
     for (const day of Object.values(rollup.days)) {
@@ -2688,14 +2704,17 @@ const VERSION = "0.7.9";
     const sessionKey = resolveSessionKey(raw.sessionKey || raw.session_key || raw.threadId || raw.thread_id || raw.conversationId || raw.conversation_id || raw.sessionId || raw.session_id);
     const threadKey = resolveSessionKey(raw.threadKey || raw.thread_key || raw.threadId || raw.thread_id || raw.conversationId || raw.conversation_id || sessionKey);
     if (isTransientSessionKey(sessionKey)) return null;
+    const source = normalizeText(raw.source, 80) || "import";
+    const importSource = normalizeText(raw.importSource, 80);
+    const rawTurnId = normalizeText(raw.turnId || raw.turn_id || raw.request_id, 240);
     const turnId =
-      normalizeText(raw.turnId || raw.turn_id || raw.request_id, 240) ||
+      ((source === "codex-session" || importSource === "codex-session") && sessionKey && rawTurnId ? `${sessionKey}\u0001${rawTurnId}` : rawTurnId) ||
       `import:${isoDateUtc(date.getTime())}:${normalizeText(raw.model, 120) || UNKNOWN_MODEL}:${usageKey(usage)}:${index}`;
     const costUsd = Number(raw.costUsd ?? raw.cost_usd ?? raw.totalCostUsd ?? raw.total_cost_usd);
     return {
       usage,
       turnId,
-      source: normalizeText(raw.source, 80) || "import",
+      source,
       ...(sessionKey ? { sessionKey } : {}),
       ...(threadKey ? { threadKey } : {}),
       callCount: toCount(raw.callCount ?? raw.call_count ?? raw.requestCount ?? raw.request_count) || 1,
@@ -2717,7 +2736,7 @@ const VERSION = "0.7.9";
           : {}),
       ...(raw.cacheWriteAvailable === true || raw.cache_write_available === true ? { cacheWriteAvailable: true } : {}),
       ...(Number.isFinite(costUsd) && costUsd >= 0 ? { costUsd } : {}),
-      ...(normalizeText(raw.importSource, 80) ? { importSource: normalizeText(raw.importSource, 80) } : {}),
+      ...(importSource ? { importSource } : {}),
     };
   }
 
@@ -2789,6 +2808,22 @@ const VERSION = "0.7.9";
     const importedAt = toCount(options.importedAt) || Date.now();
     const existing = replaceSource ? state.localLedger.filter((turn) => turn.importSource !== replaceSource && turn.source !== replaceSource) : state.localLedger.slice();
     const byId = new Map(existing.map((turn) => [turn.turnId, turn]));
+    let replaced = 0;
+    if (replaceSource) {
+      const ledger = ensureProfileLedgerLoaded();
+      const removedTurnIds = new Set(ledger.turns.filter((turn) => turn.source === replaceSource || turn.importSource === replaceSource).map((turn) => turn.turnId));
+      replaced = removedTurnIds.size;
+      if (replaced) {
+        ledger.turns = ledger.turns.filter((turn) => !removedTurnIds.has(turn.turnId));
+        for (const [id, call] of Object.entries(ledger.usageCalls || {})) {
+          if (call.source === replaceSource || removedTurnIds.has(call.turnId)) delete ledger.usageCalls[id];
+        }
+        for (const [id, invocation] of Object.entries(ledger.invocations || {})) {
+          if (invocation.source === replaceSource || removedTurnIds.has(invocation.turnId)) delete ledger.invocations[id];
+        }
+        profileLedgerRebuildTurnIndex(ledger);
+      }
+    }
     let imported = 0;
     let skipped = 0;
     items.forEach((row, index) => {
@@ -2798,15 +2833,34 @@ const VERSION = "0.7.9";
         return;
       }
       byId.set(turn.turnId, turn);
-      profileLedgerUpsertTurn({
+      const importedTurn = profileLedgerUpsertTurn({
         ...turn,
         durationStatus: "incomplete",
         persistReason: "import",
         capturedAt: importedAt,
       }, { deferRollup: true, deferSnapshot: true, deferWrite: true });
+      if (importedTurn && turn.invocations?.length) {
+        const invocationIds = new Set(importedTurn.invocationIds || []);
+        for (const [invocationIndex, invocation] of turn.invocations.entries()) {
+          const explicitId = profileInvocationEventId(invocation);
+          const invocationId = `${turn.turnId}\u0001${explicitId || `imported:${invocationIndex}:${profileInvocationKey(invocation)}`}`;
+          if (!state.profileLedger.invocations[invocationId]) {
+            state.profileLedger.invocations[invocationId] = {
+              ...invocation,
+              invocationId,
+              turnId: turn.turnId,
+              occurrence: 1,
+              observedAt: importedAt,
+              source: turn.source,
+            };
+          }
+          invocationIds.add(invocationId);
+        }
+        importedTurn.invocationIds = Array.from(invocationIds);
+      }
       imported++;
     });
-    if (imported) {
+    if (imported || replaced) {
       profileLedgerRebuildRollup();
       saveProfileLedgerSnapshot();
       profileLedgerQueueSnapshotWrite();
@@ -2819,7 +2873,7 @@ const VERSION = "0.7.9";
     if (replaceSource) rebuildAnalyticsRollup();
     scheduleProfileUsageRefresh();
     scheduleRender();
-    return { imported, skipped, total: state.localLedger.length };
+    return { imported, skipped, replaced, total: state.localLedger.length };
   }
 
   function rememberDailyUsage(metric) {
@@ -4387,7 +4441,9 @@ const VERSION = "0.7.9";
       observedAt: now,
       reason: persist ? "final-observed" : "usage-observed",
       durationStatus: "incomplete",
-      calls: existing ? [] : [{ usage, source }],
+      // Persisted responses are authoritative snapshots. Keep them on the live turn;
+      // persistLocalCurrentTurn() records the complete call set once the turn ends.
+      calls: persist || existing ? [] : [{ usage, source }],
       invocations: Array.isArray(options.invocations) ? options.invocations : context.invocations,
       invocationEventId: options.invocationEventId,
       threadKey: options.profileThreadKey,
@@ -9582,6 +9638,28 @@ const VERSION = "0.7.9";
     }
   }
 
+  async function syncCodexSessionUsageFromHelper(options = {}) {
+    if (state.codexSessionSyncInFlight) return state.codexSessionSyncPromise || { ok: false, skipped: true, refreshing: true };
+    if (typeof window.fetch !== "function") return { ok: false, skipped: true, helperUnavailable: true };
+    state.codexSessionSyncInFlight = true;
+    state.codexSessionSyncPromise = (async () => { try {
+      const payload = await helperJsonUntilReady(
+        options.refresh ? CODEX_SESSION_TURNS_REFRESH_URL : CODEX_SESSION_TURNS_URL,
+        CODEX_SESSION_TURNS_URL,
+        options,
+      );
+      if (payload?.refreshing) return { ok: false, skipped: true, refreshing: true };
+      const payloadError = normalizeText(payload?.error, 500);
+      if (payload?.ok !== true || payloadError) return { ok: false, helperUnavailable: true, error: payloadError || "codex_session_sync_failed" };
+      const turns = Array.isArray(payload?.turns) ? payload.turns : [];
+      return { ok: true, ...importLocalUsageTurns(turns, { replaceSource: "codex-session" }), source: "codex-session" };
+    } catch (error) {
+      return { ok: false, helperUnavailable: true, error: error?.message || String(error) };
+    } })();
+    try { return await state.codexSessionSyncPromise; }
+    finally { state.codexSessionSyncInFlight = false; state.codexSessionSyncPromise = null; }
+  }
+
   function refreshProfileData(options = {}) {
     if (state.profileDataRefreshPromise) return state.profileDataRefreshPromise;
     const attemptedAt = toCount(state.profileDataRefreshAttemptAt);
@@ -9591,10 +9669,11 @@ const VERSION = "0.7.9";
     state.profileDataRefreshAttemptAt = Date.now();
     const refreshOptions = { ...options, refresh: true };
     state.profileDataRefreshPromise = syncCcSwitchUsageFromHelper(refreshOptions)
-      .then((ccSwitch) => {
-        const ok = ccSwitch?.ok === true && !ccSwitch?.error;
+      .then(async (ccSwitch) => {
+        const codexSessions = await syncCodexSessionUsageFromHelper(refreshOptions);
+        const ok = ccSwitch?.ok === true || codexSessions?.ok === true;
         if (ok) state.profileDataRefreshAt = Date.now();
-        return { ok, helperStats: false, ccSwitch };
+        return { ok, helperStats: false, ccSwitch, codexSessions };
       })
       .catch((error) => ({ ok: false, error: error?.message || String(error) }))
       .finally(() => {
@@ -9605,7 +9684,7 @@ const VERSION = "0.7.9";
 
   async function refreshUsageAnalyticsFromHelper() {
     if (!state.priceEditorOpen || state.settingsPanel !== "usage") return { ok: false, skipped: true };
-    return syncCcSwitchUsageFromHelper();
+    return Promise.all([syncCcSwitchUsageFromHelper(), syncCodexSessionUsageFromHelper()]);
   }
 
   function refreshLocalHelperStatsOnStart() {
@@ -9616,10 +9695,10 @@ const VERSION = "0.7.9";
     if (window.__CODEX_LIVE_TOKEN_COST_TEST__ || state.ccSwitchStartupSyncStarted || typeof window.fetch !== "function") return;
     state.ccSwitchStartupSyncStarted = true;
     window.setTimeout(() => {
-      void syncCcSwitchUsageFromHelper().then((result) => {
-        if (!result?.ok) return;
-        const imported = toCount(result.imported);
-        state.ccSwitchSyncStatus = imported ? `启动时已同步 ${fmtCount(imported)} 条 CC Switch 统计数据` : "启动时已检查 CC Switch 统计数据";
+      void Promise.all([syncCcSwitchUsageFromHelper(), syncCodexSessionUsageFromHelper()]).then(([ccSwitch, codexSessions]) => {
+        if (!ccSwitch?.ok && !codexSessions?.ok) return;
+        const imported = toCount(ccSwitch?.imported) + toCount(codexSessions?.imported);
+        state.ccSwitchSyncStatus = imported ? `启动时已同步 ${fmtCount(imported)} 条本地 Codex 统计数据` : "已检查本地 Codex 统计数据";
         scheduleRender();
       });
     }, 1500);
@@ -9701,6 +9780,8 @@ const VERSION = "0.7.9";
     state.ccSwitchSyncGeneration += 1;
     state.ccSwitchSyncInFlight = false;
     state.ccSwitchSyncPromise = null;
+    state.codexSessionSyncInFlight = false;
+    state.codexSessionSyncPromise = null;
     if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock === VERSION) {
       Array.prototype.filter = Array.prototype.__codexLiveTokenCostOriginalFilter;
     }
@@ -9777,6 +9858,7 @@ const VERSION = "0.7.9";
     usage: localUsageExport,
     importLocalUsageTurns,
     syncCcSwitchUsageFromHelper,
+    syncCodexSessionUsageFromHelper,
     refreshProfileData,
     mergeHelperStats,
     debugSessionState,
@@ -9829,6 +9911,7 @@ const VERSION = "0.7.9";
       extractModelInfo,
       extractFastMode,
       countsTowardFastModeUsage,
+      countsTowardProfileFastMode,
       collectProfileInvocations,
       localProfileActivityStats,
       observeModelInfo,
@@ -9896,6 +9979,7 @@ const VERSION = "0.7.9";
       persistLocalCurrentTurn,
       importLocalUsageTurns,
       syncCcSwitchUsageFromHelper,
+      syncCodexSessionUsageFromHelper,
       refreshProfileData,
       helperJson,
       mergeHelperStats,

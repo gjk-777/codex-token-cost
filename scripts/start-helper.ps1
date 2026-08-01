@@ -28,4 +28,5 @@ if ($existing) {
 }
 
 $node = (Get-Command node -ErrorAction Stop).Source
-Start-Process -FilePath $node -ArgumentList @($helper, "--serve", "--host", $ListenHost, "--port", $Port) -WindowStyle Hidden
+$helperArgument = '"' + $helper + '"'
+Start-Process -FilePath $node -ArgumentList @($helperArgument, "--serve", "--host", $ListenHost, "--port", $Port) -WindowStyle Hidden

@@ -137,6 +137,73 @@ con.close()
     assert.equal(missing.ok, true);
     assert.equal(missing.error, "missing_db");
     assert.deepEqual(missing.turns, []);
+    const sessionsRoot = path.join(root, "sessions");
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    const sessionFile = path.join(sessionsRoot, "sample.jsonl");
+    fs.writeFileSync(sessionFile, [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-vscode", originator: "codex_vscode", source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1", started_at: "2026-08-01T00:00:00.000Z", model: "gpt-5.5", reasoning_effort: "medium", service_tier: "fast" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, output_tokens: 10, cached_input_tokens: 20, cache_write_input_tokens: 0, total_tokens: 110 } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 140, output_tokens: 15, cached_input_tokens: 30, cache_write_input_tokens: 2, total_tokens: 155 } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { call_id: "mcp-1", server: "node_repl" } } }),
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call", call_id: "exec-1", name: "exec", input: "rtk read C:/Users/x/.codex/skills/diagnose/SKILL.md" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "skill_invocation", turn_id: "turn-1", call_id: "skill-1", skill_name: "hello-debug" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1", completed_at: "2026-08-01T00:00:10.000Z" } }),
+    ].join("\n"));
+    fs.writeFileSync(path.join(sessionsRoot, "sample-partial.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-vscode", originator: "codex_vscode", source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1", started_at: "2026-08-01T00:00:00.000Z" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 40, output_tokens: 10, cached_input_tokens: 5, total_tokens: 50 } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { call_id: "mcp-2", server: "codegraph" } } }),
+    ].join("\n"));
+    fs.writeFileSync(path.join(sessionsRoot, "unsupported.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-cli", originator: "codex-tui", source: "cli" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-cli" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 999, output_tokens: 1, total_tokens: 1000 } } } }),
+    ].join("\n"));
+    const sessionStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "sessions-cache.json") });
+    assert.equal(sessionStats.ok, true);
+    assert.equal(sessionStats.turns.length, 1);
+    assert.deepEqual(sessionStats.turns[0].usage, { input: 140, output: 15, cached: 30, total: 155 });
+    assert.equal(sessionStats.turns[0].platform, "codex_vscode");
+    assert.equal(sessionStats.turns[0].fastMode, true);
+    assert.equal(sessionStats.turns[0].invocations.some((item) => item.plugin_id === "node_repl"), true);
+    assert.equal(sessionStats.turns[0].invocations.some((item) => item.plugin_id === "codegraph"), true);
+    assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "diagnose"), true);
+    assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "hello-debug"), true);
+    const skillOnlyFile = path.join(sessionsRoot, "skill-only.jsonl");
+    fs.writeFileSync(skillOnlyFile, [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-skill-only", originator: "codex_vscode" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call", turn_id: "skill-turn", call_id: "skill-exec", name: "exec", command: "codex skill hello-qa" } }),
+    ].join("\n"));
+    const duplicateTurnFile = path.join(sessionsRoot, "duplicate-turn.jsonl");
+    fs.writeFileSync(duplicateTurnFile, [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-other", originator: "codex_vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "mcp_tool_call_end", turn_id: "turn-1", invocation: { call_id: "mcp-other", server: "context7" } } }),
+    ].join("\n"));
+    fs.writeFileSync(path.join(sessionsRoot, "sample-complement.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-vscode", originator: "codex_vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-1" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 200, output_tokens: 1, cached_input_tokens: 2, total_tokens: 201 } } } }),
+    ].join("\n"));
+    const expandedStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "expanded-sessions-cache.json") });
+    assert.equal(expandedStats.turns.length, 3);
+    assert.equal(expandedStats.turns.some((turn) => turn.sessionKey === "session-skill-only" && turn.usage.total === 0), true);
+    assert.equal(expandedStats.turns.some((turn) => turn.sessionKey === "session-other" && turn.turnId === "turn-1"), true);
+    assert.deepEqual(expandedStats.turns.find((turn) => turn.sessionKey === "session-vscode").usage, { input: 200, output: 15, cached: 30, total: 215 });
+    const cachedSessionStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "expanded-sessions-cache.json") });
+    assert.equal(cachedSessionStats.reparsed, 0);
+    const splitBaselineFile = path.join(sessionsRoot, "split-baseline.jsonl");
+    fs.writeFileSync(splitBaselineFile, [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-split", originator: "codex_vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, output_tokens: 0, total_tokens: 100 } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "split-turn" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 150, output_tokens: 10, total_tokens: 160 } } } }),
+    ].join("\n"));
+    const splitStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "split-baseline-cache.json") });
+    const splitTurn = splitStats.turns.find((turn) => turn.sessionKey === "session-split");
+    assert.deepEqual(splitTurn.usage, { input: 50, output: 10, cached: 0, total: 60 });
     assert.equal(helper.ccSwitchStatus({ ccSwitchDbPath: ccSwitchDb }).profile_authority, "userscript-profile-ledger");
     assert.equal(helper.isLoopbackHost("127.0.0.1"), true);
     assert.equal(helper.isLoopbackHost("::1"), true);
@@ -167,6 +234,8 @@ con.close()
     let refreshCount = 0;
     const server = helper.startServer({
       ccSwitchDbPath: ccSwitchDb,
+      codexSessionsPath: sessionsRoot,
+      codexSessionsCachePath: path.join(root, "server-sessions-cache.json"),
       dbPath: serverDb,
       port,
       ccSwitchRefreshDelayMs: 25,
@@ -179,6 +248,7 @@ con.close()
       assert.equal(stats.status, 200);
       assert.equal(stats.body.bridge, "cc-switch");
       assert.equal(stats.body.profile_authority, "userscript-profile-ledger");
+      assert.equal(stats.body.codex_sessions_available, true);
       assert.equal(Object.hasOwn(stats.body, "stats"), false);
       assert.equal(Object.hasOwn(stats.body, "turns"), false);
 
@@ -203,6 +273,18 @@ con.close()
       assert.equal(ready.body.turns.length, 2);
       assert.equal(ready.body.turns[1].durationSec, 0);
       assert.equal(Object.hasOwn(ready.body, "stats"), false);
+      const sessionFirst = await requestJson(port, "/codex-sessions/turns?refresh=1");
+      assert.equal(sessionFirst.status, 202);
+      const sessionReady = await (async () => {
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          const response = await requestJson(port, "/codex-sessions/turns");
+          if (response.body.turns?.length === 1 && response.body.refreshing === false) return response;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return requestJson(port, "/codex-sessions/turns");
+      })();
+      assert.equal(sessionReady.status, 200);
+      assert.equal(sessionReady.body.turns[0].turnId, "turn-1");
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -229,6 +311,8 @@ con.close()
     assert.match(launcher, /\[ValidateSet\("127\.0\.0\.1", "::1"\)\]/);
     assert.match(launcher, /\[string\]\$ListenHost = "127\.0\.0\.1"/);
     assert.equal(/\[string\]\$Host\b/.test(launcher), false);
+    assert.match(launcher, /\$helperArgument = '"' \+ \$helper \+ '"'/);
+    assert.match(launcher, /-ArgumentList @\(\$helperArgument,/);
     assert.match(launcher, /"--host", \$ListenHost, "--port", \$Port/);
     assert.match(launcher, /Invoke-RestMethod[\s\S]*\/health/);
     assert.match(launcher, /\$health\.source -ne "codex-local-usage-helper"/);

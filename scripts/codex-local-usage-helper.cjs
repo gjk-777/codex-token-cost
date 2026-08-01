@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const readline = require("node:readline");
 const { spawn } = require("node:child_process");
 
 const DEFAULT_PORT = 17888;
@@ -16,6 +17,11 @@ const CC_SWITCH_CACHE_TTL_MS = 60000;
 const CC_SWITCH_ERROR_CACHE_TTL_MS = 5000;
 const PYTHON_TIMEOUT_MS = 30000;
 const PYTHON_MAX_BUFFER = 16 * 1024 * 1024;
+const DEFAULT_CODEX_SESSIONS_PATH = path.join(os.homedir(), ".codex", "sessions");
+const CODEX_SESSION_CACHE_TTL_MS = 60000;
+const CODEX_SESSION_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const CODEX_SESSION_CACHE_VERSION = 2;
+const SUPPORTED_CODEX_ORIGINATORS = new Set(["Codex Desktop", "codex_vscode"]);
 
 function normalizeText(value, max = 120) {
   return String(value ?? "").trim().replace(/\s+/g, " ").slice(0, max);
@@ -49,6 +55,271 @@ function writeJson(file, payload) {
 function readJson(file, fallback = {}) {
   const value = safeJsonParse(readFileText(file), fallback);
   return value && typeof value === "object" ? value : fallback;
+}
+
+function sessionTimestamp(value, fallback = Date.now()) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric < 1e12 ? numeric * 1000 : numeric;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function sessionUsageDelta(previous, current) {
+  const keys = ["input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens", "total_tokens"];
+  const delta = {};
+  for (const key of keys) {
+    const value = Math.max(0, Number(current?.[key] || 0));
+    const old = Math.max(0, Number(previous?.[key] || 0));
+    delta[key] = value >= old ? value - old : value;
+  }
+  return delta;
+}
+
+function sessionInvocation(value) {
+  const server = String(value?.server || value?.server_name || value?.serverName || value?.plugin_name || value?.pluginName || "").trim().replace(/^\$+/, "");
+  if (!server) return null;
+  const id = String(value?.call_id || value?.callId || value?.id || "").trim();
+  return { type: "plugin", plugin_id: server, plugin_name: server, ...(id ? { invocationId: id } : {}) };
+}
+
+function sessionSkillInvocations(value) {
+  if (!value || typeof value !== "object") return [];
+  const eventType = String(value.type || value.name || "").toLowerCase();
+  const fields = [value.input, value.command, value.arguments, value.params, value.skill, value.skill_name, value.skillName, value.skill_id, value.skillId];
+  const input = fields.filter((item) => item !== undefined && item !== null)
+    .map((item) => typeof item === "string" ? item : JSON.stringify(item))
+    .join("\n");
+  const names = new Set();
+  const pattern = /[\\/]skills[\\/]+(?:[^\\/"'\r\n]+[\\/]+)*([^\\/"'\r\n]+)[\\/]SKILL\.md/gi;
+  for (const match of input.matchAll(pattern)) {
+    if (match[1]) names.add(match[1].trim());
+  }
+  const explicitSkill = value.skill_name || value.skillName || value.skill_id || value.skillId ||
+    (eventType.includes("skill") && value.name !== "exec" ? value.name : "");
+  if (typeof explicitSkill === "string" && explicitSkill.trim() && !/[\\/]/.test(explicitSkill)) names.add(explicitSkill.trim());
+  if (!names.size && value.name === "exec" && /\bskills?[:\s]/i.test(input)) {
+    const match = input.match(/\bskills?[:\s]+([A-Za-z0-9_.-]+)/i);
+    if (match?.[1]) names.add(match[1]);
+  }
+  const callId = String(value.call_id || value.callId || value.id || "").trim();
+  return Array.from(names, (name) => ({
+    type: "skill",
+    skill_id: name,
+    skill_name: name,
+    ...(callId ? { invocationId: `${callId}:skill:${name}` } : {}),
+  }));
+}
+
+async function listJsonlFiles(root) {
+  const files = [];
+  if (!root || !fs.existsSync(root)) return files;
+  const pending = [root];
+  while (pending.length) {
+    const directory = pending.pop();
+    let entries;
+    try {
+      entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(fullPath);
+      else if (entry.isFile() && entry.name.toLowerCase().endsWith(".jsonl")) files.push(fullPath);
+    }
+  }
+  return files.sort();
+}
+
+async function parseCodexSessionFile(filePath) {
+  const input = fs.createReadStream(filePath, { encoding: "utf8" });
+  const reader = readline.createInterface({ input, crlfDelay: Infinity });
+  let sessionId = "";
+  let originator = "";
+  let source = "";
+  let currentTurnId = "";
+  let previousUsage = null;
+  const turns = new Map();
+  const ensureTurn = (turnId, timestamp = Date.now()) => {
+    const id = String(turnId || "").trim();
+    if (!id) return null;
+    if (!turns.has(id)) turns.set(id, {
+      turnId: id,
+      sessionKey: sessionId || path.resolve(filePath),
+      threadKey: sessionId,
+      threadAttributionStatus: "reliable",
+      source: "codex-session",
+      importSource: "codex-session",
+      platform: originator || source || "codex",
+      model: "未知",
+      effort: "",
+      fastMode: null,
+      usage: { input: 0, output: 0, cached: 0, total: 0 },
+      calls: 0,
+      invocations: [],
+      startedAt: timestamp,
+      observedAt: timestamp,
+      completedAt: 0,
+    });
+    return turns.get(id);
+  };
+  const addInvocation = (turn, invocation) => {
+    if (!turn || !invocation) return;
+    const key = invocation.invocationId || JSON.stringify(invocation);
+    if (!turn.invocations.some((item) => (item.invocationId || JSON.stringify(item)) === key)) turn.invocations.push(invocation);
+  };
+  try {
+    for await (const line of reader) {
+      const event = safeJsonParse(line, null);
+      if (!event || typeof event !== "object") continue;
+      const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+      if (event.type === "session_meta") {
+        sessionId = String(payload.id || payload.session_id || "").trim();
+        originator = String(payload.originator || "").trim();
+        source = String(payload.source || "").trim();
+        for (const turn of turns.values()) {
+          turn.sessionKey = sessionId || turn.sessionKey;
+          turn.threadKey = turn.sessionKey;
+          turn.platform = originator || source || turn.platform;
+        }
+        continue;
+      }
+      if (!sessionId) {
+        sessionId = String(payload.session_id || payload.sessionId || "").trim();
+        if (sessionId) for (const turn of turns.values()) {
+          turn.sessionKey = sessionId;
+          turn.threadKey = sessionId;
+        }
+      }
+      const eventType = payload.type || "";
+      if (event.type === "turn_context" || (event.type === "event_msg" && eventType === "task_started")) {
+        currentTurnId = String(payload.turn_id || payload.turnId || currentTurnId).trim();
+        const turn = ensureTurn(currentTurnId, sessionTimestamp(payload.started_at || event.timestamp));
+        if (turn) {
+          turn.startedAt = Math.min(turn.startedAt || Date.now(), sessionTimestamp(payload.started_at || event.timestamp));
+          turn.model = String(payload.model || payload.model_name || payload.modelName || turn.model || "未知").trim() || "未知";
+          turn.effort = String(payload.reasoning_effort || payload.reasoningEffort || payload.effort || turn.effort || "").trim();
+          const tier = String(payload.service_tier || payload.serviceTier || payload.speed_tier || "").toLowerCase();
+          if (typeof payload.fast_mode === "boolean") turn.fastMode = payload.fast_mode;
+          else if (typeof payload.fastMode === "boolean") turn.fastMode = payload.fastMode;
+          else if (tier) turn.fastMode = ["fast", "fast_mode", "priority"].includes(tier.replace(/[\s-]+/g, "_"));
+        }
+      }
+      if (event.type === "event_msg" && eventType === "task_complete") {
+        const turn = ensureTurn(payload.turn_id || payload.turnId || currentTurnId, event.timestamp);
+        if (turn) turn.completedAt = sessionTimestamp(payload.completed_at || payload.completedAt || event.timestamp);
+      }
+      const eventTurnId = String(payload.turn_id || payload.turnId || payload.info?.turn_id || payload.info?.turnId || currentTurnId).trim();
+      if (event.type === "event_msg" && eventType === "token_count") {
+        const turn = ensureTurn(eventTurnId, event.timestamp);
+        const cumulativeUsage = payload.info?.total_token_usage || payload.info?.totalTokenUsage;
+        const usage = cumulativeUsage || payload.info?.last_token_usage || payload.info?.lastTokenUsage;
+        if (usage && typeof usage === "object") {
+          const delta = cumulativeUsage ? sessionUsageDelta(previousUsage, cumulativeUsage) : {
+            input_tokens: Math.max(0, Number(usage.input_tokens || 0)),
+            output_tokens: Math.max(0, Number(usage.output_tokens || 0)),
+            cached_input_tokens: Math.max(0, Number(usage.cached_input_tokens || 0)),
+            cache_write_input_tokens: Math.max(0, Number(usage.cache_write_input_tokens || 0)),
+            total_tokens: Math.max(0, Number(usage.total_tokens || 0)),
+          };
+          if (cumulativeUsage) previousUsage = { ...cumulativeUsage };
+          if (turn) {
+            turn.usage.input += delta.input_tokens;
+            turn.usage.output += delta.output_tokens;
+            turn.usage.cached += delta.cached_input_tokens;
+            turn.usage.total = turn.usage.input + turn.usage.output;
+            turn.cacheWriteTokens = (turn.cacheWriteTokens || 0) + delta.cache_write_input_tokens;
+            turn.calls += delta.total_tokens > 0 ? 1 : 0;
+            turn.observedAt = sessionTimestamp(event.timestamp, turn.observedAt);
+          }
+        }
+      }
+      const turn = ensureTurn(eventTurnId, event.timestamp);
+      if (event.type === "event_msg" && eventType === "mcp_tool_call_end") addInvocation(turn, sessionInvocation(payload.invocation || payload));
+      if (event.type === "response_item" && eventType === "custom_tool_call") {
+        for (const invocation of sessionSkillInvocations(payload)) addInvocation(turn, invocation);
+      }
+      if (eventType.includes("skill")) {
+        for (const invocation of sessionSkillInvocations(payload)) addInvocation(turn, invocation);
+      }
+    }
+  } finally {
+    reader.close();
+    input.destroy();
+  }
+  if (!SUPPORTED_CODEX_ORIGINATORS.has(originator)) return [];
+  return Array.from(turns.values())
+    .filter((turn) => turn.usage.total > 0 || turn.invocations.length > 0)
+    .map((turn) => ({
+      ...turn,
+      createdAt: new Date(turn.startedAt || turn.observedAt).toISOString(),
+      startedAt: new Date(turn.startedAt || turn.observedAt).toISOString(),
+      finishedAt: new Date(turn.completedAt || turn.observedAt).toISOString(),
+      durationMs: Math.max(0, (turn.completedAt || turn.observedAt) - (turn.startedAt || turn.observedAt)),
+      durationSec: Math.round(Math.max(0, (turn.completedAt || turn.observedAt) - (turn.startedAt || turn.observedAt)) / 1000),
+      callCount: Math.max(1, turn.calls),
+      ...(turn.cacheWriteTokens > 0 ? { cacheWriteTokens: turn.cacheWriteTokens, cacheWriteAvailable: true } : {}),
+    }));
+}
+
+async function collectCodexSessionTurns(options = {}) {
+  const sessionsPath = options.codexSessionsPath || DEFAULT_CODEX_SESSIONS_PATH;
+  if (!fs.existsSync(sessionsPath)) return { ok: true, source: "codex-session", sessions_path: sessionsPath, turns: [], imported: 0, skipped: 0, error: "missing_sessions" };
+  const cachePath = options.codexSessionsCachePath || `${options.dbPath || DEFAULT_DB_PATH}.sessions.json`;
+  const oldCache = readJson(cachePath, { version: CODEX_SESSION_CACHE_VERSION, files: {} });
+  const reusableCache = oldCache.version === CODEX_SESSION_CACHE_VERSION ? oldCache : { files: {} };
+  const nextFiles = {};
+  let reparsed = 0;
+  for (const filePath of await listJsonlFiles(sessionsPath)) {
+    let stat;
+    try { stat = await fs.promises.stat(filePath); } catch { continue; }
+    const key = path.resolve(filePath);
+    const cached = reusableCache.files?.[key];
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && Array.isArray(cached.turns)) {
+      nextFiles[key] = cached;
+      continue;
+    }
+    nextFiles[key] = { size: stat.size, mtimeMs: stat.mtimeMs, turns: await parseCodexSessionFile(filePath) };
+    reparsed += 1;
+  }
+  const cachePayload = { version: CODEX_SESSION_CACHE_VERSION, updated_at: new Date().toISOString(), files: nextFiles };
+  if (Buffer.byteLength(JSON.stringify(cachePayload)) <= CODEX_SESSION_CACHE_MAX_BYTES) writeJson(cachePath, cachePayload);
+  const byTurnId = new Map();
+  for (const turn of Object.values(nextFiles).flatMap((entry) => entry.turns || [])) {
+    if (!SUPPORTED_CODEX_ORIGINATORS.has(turn.platform)) continue;
+    const sessionKey = `${turn.platform || "codex"}:${turn.sessionKey || "unknown"}:${turn.turnId}`;
+    const previous = byTurnId.get(sessionKey);
+    if (!previous) {
+      byTurnId.set(sessionKey, turn);
+      continue;
+    }
+    const preferred = turn.usage.total >= previous.usage.total ? turn : previous;
+    const other = preferred === turn ? previous : turn;
+    const startedAt = String(preferred.startedAt) < String(other.startedAt) ? preferred.startedAt : other.startedAt;
+    const finishedAt = String(preferred.finishedAt) > String(other.finishedAt) ? preferred.finishedAt : other.finishedAt;
+    const invocationMap = new Map();
+    for (const invocation of [...(preferred.invocations || []), ...(other.invocations || [])]) {
+      invocationMap.set(invocation.invocationId || JSON.stringify(invocation), invocation);
+    }
+    byTurnId.set(sessionKey, {
+      ...preferred,
+      startedAt,
+      finishedAt,
+      durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)),
+      durationSec: Math.round(Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)) / 1000),
+      callCount: Math.max(preferred.callCount || 0, other.callCount || 0),
+      usage: {
+        input: Math.max(preferred.usage?.input || 0, other.usage?.input || 0),
+        output: Math.max(preferred.usage?.output || 0, other.usage?.output || 0),
+        cached: Math.max(preferred.usage?.cached || 0, other.usage?.cached || 0),
+        total: Math.max(preferred.usage?.input || 0, other.usage?.input || 0) + Math.max(preferred.usage?.output || 0, other.usage?.output || 0),
+      },
+      cacheWriteTokens: Math.max(preferred.cacheWriteTokens || 0, other.cacheWriteTokens || 0),
+      invocations: Array.from(invocationMap.values()),
+    });
+  }
+  const turns = Array.from(byTurnId.values()).sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)) || left.turnId.localeCompare(right.turnId));
+  return { ok: true, source: "codex-session", sessions_path: sessionsPath, turns, imported: turns.length, skipped: 0, reparsed, updated_at: new Date().toISOString() };
 }
 
 function runPython(script, dbPath, options = {}, executable = process.env.PYTHON || "python") {
@@ -328,6 +599,9 @@ function startServer(options = {}) {
   let ccSwitchCached = null;
   let ccSwitchCachedAt = 0;
   let ccSwitchRefreshing = false;
+  let codexSessionsCached = null;
+  let codexSessionsCachedAt = 0;
+  let codexSessionsRefreshing = false;
   const refreshCcSwitch = () => {
     if (ccSwitchRefreshing) return;
     ccSwitchRefreshing = true;
@@ -354,10 +628,34 @@ function startServer(options = {}) {
       }
     }, Number(options.ccSwitchRefreshDelayMs || 0));
   };
+  const refreshCodexSessions = () => {
+    if (codexSessionsRefreshing) return;
+    codexSessionsRefreshing = true;
+    setTimeout(async () => {
+      try {
+        codexSessionsCached = await collectCodexSessionTurns(options);
+        codexSessionsCachedAt = Date.now();
+      } catch (error) {
+        codexSessionsCached = {
+          ok: false,
+          source: "codex-session",
+          sessions_path: options.codexSessionsPath || DEFAULT_CODEX_SESSIONS_PATH,
+          turns: [],
+          imported: 0,
+          skipped: 0,
+          error: normalizeText(error?.message || String(error), 500),
+          updated_at: new Date().toISOString(),
+        };
+        codexSessionsCachedAt = Date.now();
+      } finally {
+        codexSessionsRefreshing = false;
+      }
+    }, Number(options.codexSessionsRefreshDelayMs || 0));
+  };
   const server = http.createServer((req, res) => {
     const origin = req.headers.origin || "";
     const url = new URL(req.url || "/", "http://localhost");
-    const protectedPath = url.pathname === "/stats" || url.pathname === "/cc-switch/turns";
+    const protectedPath = url.pathname === "/stats" || url.pathname === "/cc-switch/turns" || url.pathname === "/codex-sessions/turns";
     if (protectedPath && !isAllowedOrigin(origin)) {
       sendJson(res, 403, { ok: false, error: "forbidden_origin" }, origin);
       return;
@@ -372,7 +670,14 @@ function startServer(options = {}) {
     }
     if (url.pathname === "/stats") {
       const status = ccSwitchStatus(options);
-      sendJson(res, 200, { ...status, cached: Boolean(cached?.cc_switch?.ok), refreshing: ccSwitchRefreshing }, origin);
+      sendJson(res, 200, {
+        ...status,
+        cached: Boolean(cached?.cc_switch?.ok),
+        refreshing: ccSwitchRefreshing,
+        codex_sessions_available: fs.existsSync(options.codexSessionsPath || DEFAULT_CODEX_SESSIONS_PATH),
+        codex_sessions_cached: Boolean(codexSessionsCached?.ok),
+        codex_sessions_refreshing: codexSessionsRefreshing,
+      }, origin);
       return;
     }
     if (url.pathname === "/cc-switch/turns") {
@@ -391,6 +696,21 @@ function startServer(options = {}) {
       sendJson(res, ccSwitchCached?.ok ? 200 : 202, { ...payload, refreshing: ccSwitchRefreshing }, origin);
       return;
     }
+    if (url.pathname === "/codex-sessions/turns") {
+      const forceRefresh = url.searchParams.get("refresh") === "1" || url.searchParams.get("refresh") === "true";
+      const stale = !codexSessionsCached || !codexSessionsCachedAt || Date.now() - codexSessionsCachedAt > CODEX_SESSION_CACHE_TTL_MS;
+      if (forceRefresh || stale) refreshCodexSessions();
+      const payload = codexSessionsCached || {
+        ok: true,
+        source: "codex-session",
+        sessions_path: options.codexSessionsPath || DEFAULT_CODEX_SESSIONS_PATH,
+        turns: [],
+        imported: 0,
+        skipped: 0,
+      };
+      sendJson(res, codexSessionsCached?.ok ? 200 : 202, { ...payload, refreshing: codexSessionsRefreshing }, origin);
+      return;
+    }
     sendJson(res, 404, { ok: false, error: "not_found" }, origin);
   });
   server.listen(port, host, () => {
@@ -407,12 +727,14 @@ function parseArgs(argv) {
     else if (arg === "--host") options.host = argv[++i];
     else if (arg === "--db") options.dbPath = argv[++i];
     else if (arg === "--cc-switch-db") options.ccSwitchDbPath = argv[++i];
+    else if (arg === "--codex-sessions") options.codexSessionsPath = argv[++i];
     else if (arg === "--serve") options.serve = true;
   }
   return options;
 }
 
 module.exports = {
+  collectCodexSessionTurns,
   collectCcSwitchTurns,
   ccSwitchStatus,
   isLoopbackHost,
