@@ -147,6 +147,7 @@ con.close()
       JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 140, output_tokens: 15, cached_input_tokens: 30, cache_write_input_tokens: 2, total_tokens: 155 } } } }),
       JSON.stringify({ type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { call_id: "mcp-1", server: "node_repl" } } }),
       JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call", call_id: "exec-1", name: "exec", input: "rtk read C:/Users/x/.codex/skills/diagnose/SKILL.md" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call", call_id: "exec-helloagents", name: "exec", input: "rtk read C:/Users/x/.codex/plugins/cache/local-plugins/helloagents/4.0.3/skills/hello-debug/SKILL.md" } }),
       JSON.stringify({ type: "event_msg", payload: { type: "skill_invocation", turn_id: "turn-1", call_id: "skill-1", skill_name: "hello-debug" } }),
       JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-1", completed_at: "2026-08-01T00:00:10.000Z" } }),
     ].join("\n"));
@@ -171,6 +172,7 @@ con.close()
     assert.equal(sessionStats.turns[0].invocations.some((item) => item.plugin_id === "codegraph"), true);
     assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "diagnose"), true);
     assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "hello-debug"), true);
+    assert.equal(sessionStats.turns[0].invocations.find((item) => item.skill_id === "hello-debug")?.owner_plugin_id, "helloagents");
     const skillOnlyFile = path.join(sessionsRoot, "skill-only.jsonl");
     fs.writeFileSync(skillOnlyFile, [
       JSON.stringify({ type: "session_meta", payload: { id: "session-skill-only", originator: "codex_vscode" } }),

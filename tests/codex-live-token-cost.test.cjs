@@ -4728,6 +4728,40 @@ profileLifecycleTest.then(async () => {
   const messageTurnInvocations = api.localUsageExport().currentTurn.invocations;
   assert.equal(messageTurnInvocations.some((item) => item.plugin_id === "chrome_devtools"), true);
   assert.equal(messageTurnInvocations.some((item) => item.skill_id === "systematic-debugging"), true);
+  api.inspectLocalPayload(
+    {
+      threadId: messageInvocationSession,
+      turnId: messageInvocationTurn,
+      type: "mcp-notification",
+      method: "item/completed",
+      params: {
+        item: {
+          type: "commandExecution",
+          id: "helloagents-skill-call",
+          command: 'rtk read "C:\\\\Users\\\\LEGION\\\\.codex\\\\plugins\\\\cache\\\\local-plugins\\\\helloagents\\\\4.0.3\\\\skills\\\\hello-debug\\\\SKILL.md"',
+        },
+      },
+    },
+    "message",
+  );
+  assert.equal(api.localUsageExport().currentTurn.invocations.find((item) => item.skill_id === "hello-debug")?.owner_plugin_id, "helloagents");
+  api.inspectLocalPayload(
+    {
+      threadId: messageInvocationSession,
+      turnId: messageInvocationTurn,
+      type: "mcp-notification",
+      method: "item/completed",
+      params: {
+        item: {
+          type: "commandExecution",
+          id: "ponytail-skill-call",
+          command: 'rtk read "C:\\\\Users\\\\LEGION\\\\.codex\\\\plugins\\\\cache\\\\ponytail\\\\ponytail\\\\4.8.4+codex.local-ui\\\\skills\\\\ponytail-review\\\\SKILL.md"',
+        },
+      },
+    },
+    "message",
+  );
+  assert.equal(api.localUsageExport().currentTurn.invocations.find((item) => item.skill_id === "ponytail-review")?.owner_plugin_id, "ponytail");
   api.rememberLocalUsage(
     { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
     "message",
@@ -4738,6 +4772,10 @@ profileLifecycleTest.then(async () => {
   const messageInvocationProfile = api.localProfileResponse();
   assert.equal(
     messageInvocationProfile.stats.top_plugins.find((item) => item.plugin_id === "chrome_devtools")?.usage_count,
+    1,
+  );
+  assert.equal(
+    messageInvocationProfile.stats.top_plugins.find((item) => item.plugin_id === "helloagents")?.usage_count,
     1,
   );
   assert.equal(

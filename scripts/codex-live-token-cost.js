@@ -903,6 +903,21 @@ const VERSION = "0.7.9";
     const topEffort = effortEntries[0];
     const skillItems = invocationEntries.filter((item) => item.type === "skill");
     const pluginItems = invocationEntries.filter((item) => item.type === "plugin");
+    const pluginPackageCounts = new Map();
+    const addPluginPackage = (pluginId, pluginName, count) => {
+      const id = normalizeText(pluginId || pluginName, 120).replace(/^\$+/, "");
+      if (!id || count <= 0) return;
+      const current = pluginPackageCounts.get(id) || { type: "plugin", plugin_id: id, plugin_name: normalizeText(pluginName || id, 80), usage_count: 0 };
+      current.usage_count += count;
+      pluginPackageCounts.set(id, current);
+    };
+    for (const item of pluginItems) addPluginPackage(item.plugin_id, item.plugin_name, toCount(item.usage_count));
+    for (const item of skillItems) {
+      if (item.owner_plugin_id || item.owner_plugin_name) addPluginPackage(item.owner_plugin_id, item.owner_plugin_name, toCount(item.usage_count));
+    }
+    const topPluginPackages = Array.from(pluginPackageCounts.values())
+      .sort((left, right) => right.usage_count - left.usage_count || profileInvocationKey(left).localeCompare(profileInvocationKey(right)))
+      .slice(0, 5);
     const totalEffort = effortEntries.reduce((sum, item) => sum + toCount(item[1]), 0);
     const stats = {
       fastModePercent: source.totalTokens ? Math.round((source.fastModeTokens / source.totalTokens) * 100) : null,
@@ -913,10 +928,11 @@ const VERSION = "0.7.9";
       reasoningEffortPercent: totalEffort && topEffort ? Math.round((toCount(topEffort[1]) / totalEffort) * 100) : null,
       uniqueSkillsUsed: new Set(skillItems.map((item) => item.skill_id || item.skill_name).filter(Boolean)).size,
       totalSkillsUsed: skillItems.reduce((sum, item) => sum + toCount(item.usage_count), 0),
-      uniquePluginsUsed: new Set(pluginItems.map((item) => item.plugin_id || item.plugin_name).filter(Boolean)).size,
-      totalPluginsUsed: pluginItems.reduce((sum, item) => sum + toCount(item.usage_count), 0),
+      uniquePluginsUsed: pluginPackageCounts.size,
+      totalPluginsUsed: Array.from(pluginPackageCounts.values()).reduce((sum, item) => sum + toCount(item.usage_count), 0),
       topInvocations: invocationEntries.slice(0, 5),
-      topPlugins: pluginItems.slice(0, 5),
+      topPlugins: topPluginPackages,
+      topMcpPlugins: pluginItems.slice(0, 5),
     };
     if (!options.includeLedgerFields) return stats;
     return {
@@ -3877,7 +3893,15 @@ const VERSION = "0.7.9";
       return { type: "plugin", ...(pluginId ? { plugin_id: pluginId } : {}), ...(pluginName ? { plugin_name: pluginName } : {}) };
     }
     if (skillName || skillId) {
-      return { type: "skill", ...(skillId ? { skill_id: skillId } : {}), ...(skillName ? { skill_name: skillName } : {}) };
+      const ownerPluginId = normalizeText(value.owner_plugin_id ?? value.ownerPluginId, 120).replace(/^\$+/, "");
+      const ownerPluginName = normalizeText(value.owner_plugin_name ?? value.ownerPluginName, 80).replace(/^\$+/, "");
+      return {
+        type: "skill",
+        ...(skillId ? { skill_id: skillId } : {}),
+        ...(skillName ? { skill_name: skillName } : {}),
+        ...(ownerPluginId ? { owner_plugin_id: ownerPluginId } : {}),
+        ...(ownerPluginName ? { owner_plugin_name: ownerPluginName } : {}),
+      };
     }
     return null;
   }
@@ -3917,15 +3941,24 @@ const VERSION = "0.7.9";
     const input = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput || {});
     const callId = normalizeText(notificationItem?.id, 180) || profileInvocationEventId(value);
     const names = new Set();
+    const ownerBySkill = new Map();
+    const ownerPattern = /plugins[\\/]cache[\\/]([^"'\r\n]+?)[\\/]skills[\\/]([^\\/"'\r\n]+)[\\/]SKILL\.md/gi;
+    for (const match of input.matchAll(ownerPattern)) {
+      const pathParts = String(match[1]).split(/[\\/]+/).filter(Boolean);
+      const name = normalizeText(match[2], 120);
+      if (name && pathParts.length >= 2) ownerBySkill.set(name, normalizeText(pathParts[pathParts.length - 2], 120).replace(/^\$+/, ""));
+    }
     const pattern = /[\\/]skills[\\/]+(?:[^\\/"'\r\n]+[\\/]+)*([^\\/"'\r\n]+)[\\/]+SKILL\.md/gi;
     for (const match of input.matchAll(pattern)) {
       const name = normalizeText(match[1], 120);
-      if (name) names.add(name);
+      if (!name) continue;
+      names.add(name);
     }
     return Array.from(names, (name) => ({
       type: "skill",
       skill_id: name,
       skill_name: name,
+      ...(ownerBySkill.has(name) ? { owner_plugin_id: ownerBySkill.get(name), owner_plugin_name: ownerBySkill.get(name) } : {}),
       ...(callId ? { invocationId: `${callId}:skill:${name}` } : {}),
     }));
   }
@@ -3954,7 +3987,9 @@ const VERSION = "0.7.9";
   }
 
   function profileInvocationKey(invocation) {
-    return [invocation.type, invocation.plugin_id || "", invocation.plugin_name || "", invocation.skill_id || "", invocation.skill_name || ""].join("\u0001");
+    const base = [invocation.type, invocation.plugin_id || "", invocation.plugin_name || "", invocation.skill_id || "", invocation.skill_name || ""].join("\u0001");
+    const owner = invocation.owner_plugin_id || invocation.owner_plugin_name || "";
+    return owner ? `${base}\u0001${owner}` : base;
   }
 
   function localProfileActivityStats(turns) {

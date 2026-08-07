@@ -90,6 +90,13 @@ function sessionSkillInvocations(value) {
     .map((item) => typeof item === "string" ? item : JSON.stringify(item))
     .join("\n");
   const names = new Set();
+  const ownerBySkill = new Map();
+  const ownerPattern = /plugins[\\/]cache[\\/]([^"'\r\n]+?)[\\/]skills[\\/]([^\\/"'\r\n]+)[\\/]SKILL\.md/gi;
+  for (const match of input.matchAll(ownerPattern)) {
+    const pathParts = String(match[1]).split(/[\\/]+/).filter(Boolean);
+    const name = normalizeText(match[2], 120);
+    if (name && pathParts.length >= 2) ownerBySkill.set(name, normalizeText(pathParts[pathParts.length - 2], 120).replace(/^\$+/, ""));
+  }
   const pattern = /[\\/]skills[\\/]+(?:[^\\/"'\r\n]+[\\/]+)*([^\\/"'\r\n]+)[\\/]SKILL\.md/gi;
   for (const match of input.matchAll(pattern)) {
     if (match[1]) names.add(match[1].trim());
@@ -106,6 +113,7 @@ function sessionSkillInvocations(value) {
     type: "skill",
     skill_id: name,
     skill_name: name,
+    ...(ownerBySkill.has(name) ? { owner_plugin_id: ownerBySkill.get(name), owner_plugin_name: ownerBySkill.get(name) } : {}),
     ...(callId ? { invocationId: `${callId}:skill:${name}` } : {}),
   }));
 }
