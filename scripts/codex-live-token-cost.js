@@ -83,6 +83,7 @@ const VERSION = "0.7.9";
   const CODEX_SESSION_TURNS_URL = "http://127.0.0.1:17888/codex-sessions/turns";
   const CODEX_SESSION_TURNS_REFRESH_URL = `${CODEX_SESSION_TURNS_URL}?refresh=1`;
   const PROFILE_DATA_REFRESH_MIN_INTERVAL_MS = 60000;
+  const CODEX_SESSION_SYNC_MIN_INTERVAL_MS = 120000;
   const HELPER_REFRESH_POLL_INTERVAL_MS = 500;
   const HELPER_REFRESH_MAX_POLLS = 60;
   const HELPER_BRIDGE_RETRY_DELAYS_MS = [0, 250, 1000];
@@ -275,6 +276,8 @@ const VERSION = "0.7.9";
     localMessageHandler: null,
     profileRequestIds: new Map(),
     codexModulePromises: new Map(),
+    profilePatchGeneration: 0,
+    profilePatchRestorers: [],
     detectedModel: "",
     detectedEffort: "",
     detectedFastMode: false,
@@ -323,6 +326,7 @@ const VERSION = "0.7.9";
     profileDataRefreshAttemptAt: 0,
     profileDataRefreshAt: 0,
     profileDataRefreshPromise: null,
+    profileDataRefreshForce: false,
     helperStatus: HELPER_STATUS_DEFAULT,
     helperUnavailable: false,
     helperCheckedAt: 0,
@@ -335,6 +339,7 @@ const VERSION = "0.7.9";
     ccSwitchSyncGeneration: 0,
     codexSessionSyncInFlight: false,
     codexSessionSyncPromise: null,
+    codexSessionSyncAt: 0,
     ccSwitchStartupSyncStarted: false,
     ccSwitchSyncStatus: "",
     settingsStatusPulseFrame: 0,
@@ -356,6 +361,36 @@ const VERSION = "0.7.9";
     officialThreadRuntimeStates: new Map(),
     runtimeSessionBindings: new Map(),
   };
+
+  function registerProfilePropertyRestore(target, key, originalDescriptor, installedDescriptor) {
+    if (!installedDescriptor) return;
+    state.profilePatchRestorers.push(() => {
+      const currentDescriptor = Object.getOwnPropertyDescriptor(target, key);
+      const stillInstalled = "value" in installedDescriptor
+        ? currentDescriptor?.value === installedDescriptor.value
+        : currentDescriptor?.get === installedDescriptor.get && currentDescriptor?.set === installedDescriptor.set;
+      if (!stillInstalled) return;
+      if (originalDescriptor) Object.defineProperty(target, key, originalDescriptor);
+      else delete target[key];
+    });
+  }
+
+  function restoreProfilePatches() {
+    state.profilePatchGeneration += 1;
+    const restorers = state.profilePatchRestorers.slice().reverse();
+    state.profilePatchRestorers = [];
+    for (const restore of restorers) {
+      try {
+        restore();
+      } catch {
+        // A changed or read-only host object cannot always be restored.
+      }
+    }
+  }
+
+  function profilePatchGenerationCurrent(generation) {
+    return state.started && profileUnlockEnabled() && state.profilePatchGeneration === generation;
+  }
 
   function toCount(value) {
     const n = Number(value);
@@ -763,7 +798,15 @@ const VERSION = "0.7.9";
       });
   }
 
-  function profileLedgerQueueWrite(turn, calls = [], invocations = []) {
+  function profileRollupDaysForTurn(turn, previousTurn = null) {
+    const dates = new Set([previousTurn, turn].map((item) => localDateKey(turnTimestampMs(item))).filter(Boolean));
+    return Array.from(dates, (date) => {
+      const day = state.profileLedger?.rollup?.days?.[date];
+      return day ? { date, ...day } : { date, deleted: true };
+    });
+  }
+
+  function profileLedgerQueueWrite(turn, calls = [], invocations = [], previousTurn = null) {
     if (state.profileLedgerStorage !== "indexeddb") return;
     state.profileLedgerWriteQueue = state.profileLedgerWriteQueue
       .then(
@@ -771,7 +814,7 @@ const VERSION = "0.7.9";
       )
       .then((db) => {
         if (!db || state.profileLedgerStorage !== "indexeddb") return null;
-        const rollupDays = Object.entries(state.profileLedger?.rollup?.days || {}).map(([date, value]) => ({ date, ...value }));
+        const rollupDays = profileRollupDaysForTurn(turn, previousTurn);
         return new Promise((resolve, reject) => {
           const tx = db.transaction(
             [PROFILE_LEDGER_STORE_TURNS, PROFILE_LEDGER_STORE_USAGE_CALLS, PROFILE_LEDGER_STORE_INVOCATIONS, PROFILE_LEDGER_STORE_DAILY_ROLLUPS],
@@ -780,7 +823,11 @@ const VERSION = "0.7.9";
           if (turn) tx.objectStore(PROFILE_LEDGER_STORE_TURNS).put(turn);
           calls.forEach((call) => tx.objectStore(PROFILE_LEDGER_STORE_USAGE_CALLS).put(call));
           invocations.forEach((invocation) => tx.objectStore(PROFILE_LEDGER_STORE_INVOCATIONS).put(invocation));
-          rollupDays.forEach((day) => tx.objectStore(PROFILE_LEDGER_STORE_DAILY_ROLLUPS).put(day));
+          rollupDays.forEach((day) => {
+            const store = tx.objectStore(PROFILE_LEDGER_STORE_DAILY_ROLLUPS);
+            if (day.deleted) store.delete(day.date);
+            else store.put(day);
+          });
           tx.oncomplete = resolve;
           tx.onerror = () => reject(tx.error || new Error("profile ledger IndexedDB write failed"));
           tx.onabort = () => reject(tx.error || new Error("profile ledger IndexedDB write transaction aborted"));
@@ -1033,7 +1080,7 @@ const VERSION = "0.7.9";
     else profileLedgerTurnIndex(ledger).set(merged.turnId, ledger.turns.push(merged) - 1);
     if (!options.deferRollup) profileLedgerRebuildRollup();
     if (!options.deferSnapshot) saveProfileLedgerSnapshot();
-    if (!options.deferWrite) profileLedgerQueueWrite(merged, options.calls, options.invocations);
+    if (!options.deferWrite) profileLedgerQueueWrite(merged, options.calls, options.invocations, existing);
     return merged;
   }
 
@@ -1123,7 +1170,7 @@ const VERSION = "0.7.9";
     else profileLedgerTurnIndex(ledger).set(merged.turnId, ledger.turns.push(merged) - 1);
     profileLedgerRebuildRollup();
     saveProfileLedgerSnapshot();
-    profileLedgerQueueWrite(merged, calls, invocations);
+    profileLedgerQueueWrite(merged, calls, invocations, previous);
     return true;
   }
 
@@ -1364,30 +1411,30 @@ const VERSION = "0.7.9";
 
   function isoDateAddDays(dateIso, days) {
     const date = new Date(`${dateIso}T00:00:00.000Z`);
-    if (!Number.isFinite(date.getTime())) return isoDateUtc();
+    if (!Number.isFinite(date.getTime())) return todayKey();
     date.setUTCDate(date.getUTCDate() + days);
     return date.toISOString().slice(0, 10);
   }
 
   function isoWeekStartUtc(dateIso) {
     const date = new Date(`${dateIso}T00:00:00.000Z`);
-    if (!Number.isFinite(date.getTime())) return isoWeekStartUtc(isoDateUtc());
+    if (!Number.isFinite(date.getTime())) return isoWeekStartUtc(todayKey());
     date.setUTCDate(date.getUTCDate() - date.getUTCDay());
     return date.toISOString().slice(0, 10);
   }
 
-  function profileHeatmapColumnCount(todayIso = isoDateUtc()) {
+  function profileHeatmapColumnCount(todayIso = todayKey()) {
     const currentWeek = new Date(`${isoWeekStartUtc(todayIso)}T00:00:00.000Z`).getTime();
     const baseWeek = new Date(`${PROFILE_HEATMAP_BASE_START}T00:00:00.000Z`).getTime();
     const weeks = Math.floor((currentWeek - baseWeek) / (7 * 24 * 60 * 60 * 1000));
     return Math.min(PROFILE_HEATMAP_MAX_COLUMNS, Math.max(1, weeks + 1));
   }
 
-  function profileHeatmapStartDate(todayIso = isoDateUtc()) {
+  function profileHeatmapStartDate(todayIso = todayKey()) {
     return isoDateAddDays(isoWeekStartUtc(todayIso), -(profileHeatmapColumnCount(todayIso) - 1) * 7);
   }
 
-  function localProfileDailyUsageBuckets(days, todayIso = isoDateUtc()) {
+  function localProfileDailyUsageBuckets(days, todayIso = todayKey()) {
     const byDate = new Map(days.map((day) => [day.date, day]));
     const buckets = [];
     for (let date = profileHeatmapStartDate(todayIso); date <= todayIso; date = isoDateAddDays(date, 1)) {
@@ -1405,7 +1452,7 @@ const VERSION = "0.7.9";
     return buckets;
   }
 
-  function localProfileStreakStats(days, todayIso = isoDateUtc()) {
+  function localProfileStreakStats(days, todayIso = todayKey()) {
     const usageDates = new Set(days.filter((day) => toCount(day.tokens) > 0).map((day) => day.date));
     let current = 0;
     for (let date = todayIso; usageDates.has(date); date = isoDateAddDays(date, -1)) current++;
@@ -1745,8 +1792,18 @@ const VERSION = "0.7.9";
 
   function patchProfileReactAuthContext(authContext, componentNames) {
     if (!authContext || !componentNames?.length) return false;
+    if (authContext.__codexLiveTokenCostProfileAuthPatch === VERSION) {
+      authContext.__codexLiveTokenCostProfileUiComponents = new Set(componentNames);
+      return true;
+    }
+    const componentsDescriptor = Object.getOwnPropertyDescriptor(authContext, "__codexLiveTokenCostProfileUiComponents");
     authContext.__codexLiveTokenCostProfileUiComponents = new Set(componentNames);
-    if (authContext.__codexLiveTokenCostProfileAuthPatch === VERSION) return true;
+    registerProfilePropertyRestore(
+      authContext,
+      "__codexLiveTokenCostProfileUiComponents",
+      componentsDescriptor,
+      Object.getOwnPropertyDescriptor(authContext, "__codexLiveTokenCostProfileUiComponents"),
+    );
     const fields = ["_currentValue", "_currentValue2"].filter((field) => field in authContext);
     if (!fields.length) return false;
     const patchedFields = [];
@@ -1773,9 +1830,17 @@ const VERSION = "0.7.9";
             else currentValue = value;
           },
         });
+        registerProfilePropertyRestore(authContext, field, descriptor, Object.getOwnPropertyDescriptor(authContext, field));
         patchedFields.push({ descriptor, field });
       }
+      const markerDescriptor = Object.getOwnPropertyDescriptor(authContext, "__codexLiveTokenCostProfileAuthPatch");
       authContext.__codexLiveTokenCostProfileAuthPatch = VERSION;
+      registerProfilePropertyRestore(
+        authContext,
+        "__codexLiveTokenCostProfileAuthPatch",
+        markerDescriptor,
+        Object.getOwnPropertyDescriptor(authContext, "__codexLiveTokenCostProfileAuthPatch"),
+      );
       return true;
     } catch {
       for (const { descriptor, field } of patchedFields.reverse()) {
@@ -2745,6 +2810,7 @@ const VERSION = "0.7.9";
       finishedAt: new Date(finishedAt).toISOString(),
       durationMs,
       durationSec: Math.round(durationMs / 1000),
+      durationStatus: raw.durationStatus === "completed" ? "completed" : raw.durationStatus === "recovered" ? "recovered" : "incomplete",
       ...(raw.timeGranularity === "hour" || raw.time_granularity === "hour"
         ? { timeGranularity: "hour" }
         : raw.timeGranularity === "day" || raw.time_granularity === "day"
@@ -2851,7 +2917,7 @@ const VERSION = "0.7.9";
       byId.set(turn.turnId, turn);
       const importedTurn = profileLedgerUpsertTurn({
         ...turn,
-        durationStatus: "incomplete",
+        durationStatus: turn.durationStatus,
         persistReason: "import",
         capturedAt: importedAt,
       }, { deferRollup: true, deferSnapshot: true, deferWrite: true });
@@ -2967,6 +3033,16 @@ const VERSION = "0.7.9";
 
   function requestMethod(input, init) {
     return String(init?.method || input?.method || "GET").toUpperCase();
+  }
+
+  async function requestBody(input, init) {
+    if (init && Object.hasOwn(init, "body")) return init.body;
+    if (!input || typeof input.clone !== "function") return undefined;
+    try {
+      return await input.clone().text();
+    } catch {
+      return undefined;
+    }
   }
 
   function extractSessionKeyFromUrl(value) {
@@ -4747,12 +4823,16 @@ const VERSION = "0.7.9";
     return visible;
   }
 
-  function analyticsTurnTimestampMs(turn) {
-    const timestamp = turnTimestampMs(turn);
+  function analyticsTurnHasDayGranularity(turn) {
+    if (turn?.timeGranularity === "day") return true;
     const source = normalizeText(turn?.source, 80);
     const importSource = normalizeText(turn?.importSource, 80);
-    const isCcSwitch = source === "cc-switch" || importSource === "cc-switch";
-    return isCcSwitch && turn?.timeGranularity !== "hour" ? startOfLocalDay(timestamp) : timestamp;
+    return (source === "cc-switch" || importSource === "cc-switch") && turn?.timeGranularity !== "hour";
+  }
+
+  function analyticsTurnTimestampMs(turn) {
+    const timestamp = turnTimestampMs(turn);
+    return analyticsTurnHasDayGranularity(turn) ? startOfLocalDay(timestamp) : timestamp;
   }
 
   function emptyUsageAnalytics() {
@@ -4767,6 +4847,8 @@ const VERSION = "0.7.9";
       calls: 0,
       cost: 0,
       priced: true,
+      estimatedCost: false,
+      storedCost: false,
       cacheHitRate: null,
       models: [],
     };
@@ -4786,6 +4868,8 @@ const VERSION = "0.7.9";
       const cacheWrite = Math.min(Math.max(0, toCount(usage.input) - cacheRead), toCount(usage.cacheWriteTokens ?? usage.cacheCreationTokens));
       const model = normalizeText(turn?.model, 120) || UNKNOWN_MODEL;
       const cost = turnCost(turn, model);
+      const hasStoredCost = storedTurnCost(turn) != null;
+      const estimatedCost = !hasStoredCost && cost.priced && !cost.hidden && usageHasCostData(usage);
       const item =
         models.get(model) ||
         {
@@ -4794,11 +4878,15 @@ const VERSION = "0.7.9";
           calls: 0,
           cost: 0,
           priced: true,
+          estimatedCost: false,
+          storedCost: false,
         };
       item.usage = addUsage(item.usage, usage);
       item.calls += toCount(turn?.callCount) || 1;
       item.cost += cost.value;
       item.priced = item.priced && cost.priced;
+      item.estimatedCost = item.estimatedCost || estimatedCost;
+      item.storedCost = item.storedCost || hasStoredCost;
       models.set(model, item);
       totals.totalTokens += toCount(usage.total || usage.input + usage.output);
       totals.input += toCount(usage.input);
@@ -4810,6 +4898,8 @@ const VERSION = "0.7.9";
       totals.calls += toCount(turn?.callCount) || 1;
       totals.cost += cost.value;
       totals.priced = totals.priced && cost.priced;
+      totals.estimatedCost = totals.estimatedCost || estimatedCost;
+      totals.storedCost = totals.storedCost || hasStoredCost;
     }
     totals.cacheHitRate = totals.input ? Math.round((totals.cacheRead / totals.input) * 100) : null;
     totals.models = Array.from(models.values())
@@ -4913,6 +5003,7 @@ const VERSION = "0.7.9";
           turnId: `analytics:${date}:${model}`,
           source: "analytics-rollup",
           createdAt: `${date}T12:00:00`,
+          timeGranularity: "day",
           model,
           callCount: toCount(item?.calls) || 1,
           usage: normalizeUsage(item?.usage),
@@ -4941,12 +5032,33 @@ const VERSION = "0.7.9";
     return `较上期 ${percent > 0 ? "+" : ""}${percent}%`;
   }
 
+  function analyticsChartMode(turns, range) {
+    const startMs = toTimestampMs(range?.startMs);
+    const endMs = toTimestampMs(range?.endMs);
+    if (!startMs || !endMs || endMs < startMs) return "day";
+    const daySpan = Math.max(1, Math.ceil((endOfLocalDay(endMs) - startOfLocalDay(startMs) + 1) / 86_400_000));
+    if (daySpan > 90) return "week";
+    if (daySpan > 1) return "day";
+    const hasDailyAggregate = (Array.isArray(turns) ? turns : []).some((turn) => {
+      if (!analyticsTurnHasDayGranularity(turn)) return false;
+      const timestamp = analyticsTurnTimestampMs(turn);
+      return timestamp >= startMs && timestamp <= endMs;
+    });
+    return hasDailyAggregate ? "day" : "hour";
+  }
+
+  function analyticsChartGranularityLabel(turns, range) {
+    const mode = analyticsChartMode(turns, range);
+    if (mode === "hour") return "按小时";
+    if (mode === "week") return "按周";
+    return (Array.isArray(turns) ? turns : []).some(analyticsTurnHasDayGranularity) ? "按日（含汇总）" : "按日";
+  }
+
   function analyticsChartBuckets(turns, range, metric = "tokens") {
     const startMs = toTimestampMs(range?.startMs);
     const endMs = toTimestampMs(range?.endMs);
     if (!startMs || !endMs || endMs < startMs) return [];
-    const daySpan = Math.max(1, Math.ceil((endOfLocalDay(endMs) - startOfLocalDay(startMs) + 1) / 86_400_000));
-    const mode = daySpan === 1 ? "hour" : daySpan <= 90 ? "day" : "week";
+    const mode = analyticsChartMode(turns, range);
     const buckets = [];
     const bucketMap = new Map();
     if (mode === "hour") {
@@ -5063,7 +5175,7 @@ const VERSION = "0.7.9";
           <span title="${escapeHtml(item.model)}">${escapeHtml(item.model)}</span>
           <span>${fmtCount(item.tokens)}</span>
           <span>${fmtCount(item.calls)}</span>
-          <span>${item.priced ? fmtMoney(item.cost) : `${fmtMoney(item.cost)} · 部分`}</span>
+          <span>${item.priced ? `${fmtMoney(item.cost)}${item.estimatedCost ? item.storedCost ? " · 含估算" : " · 估算" : ""}` : `${fmtMoney(item.cost)} · 部分`}</span>
           <span>${Math.round(item.share)}%</span>
         </button>`,
       )
@@ -5071,7 +5183,7 @@ const VERSION = "0.7.9";
     return `
       <section class="cltc-settings-section cltc-analytics" data-analytics-preset="${preset}" data-analytics-model-filter="${escapeHtml(model)}">
         <div class="cltc-settings-section-heading cltc-analytics-heading">
-          <div><h2>使用统计</h2><p>基于 HUD、Profile 与 CC Switch 相同的本地去重口径。</p></div>
+          <div><h2>使用统计</h2><p>仅汇总本机已捕获的用量记录；重叠来源按覆盖优先去重。</p></div>
           ${model ? `<button type="button" class="cltc-analytics-filter" data-action="clear-analytics-model">${escapeHtml(model)} ×</button>` : ""}
         </div>
         <div class="cltc-analytics-toolbar">
@@ -5089,13 +5201,13 @@ const VERSION = "0.7.9";
         ${state.helperUnavailable ? `<button type="button" class="cltc-analytics-degraded" data-settings-panel="general">Helper 未运行，部分历史来源不可用 · 前往数据与显示</button>` : ""}
         <div class="cltc-analytics-metrics">
           ${metricRow("总 Token", fmtCount(current.totalTokens), { current: current.totalTokens, previous: previous.totalTokens })}
-          ${metricRow("总花费", current.priced ? fmtMoney(current.cost) : `${fmtMoney(current.cost)} · 部分统计`, { current: current.cost, previous: previous.cost }, !current.priced || !previous.priced)}
-          ${metricRow("模型调用", fmtCount(current.calls), { current: current.calls, previous: previous.calls })}
+          ${metricRow(current.estimatedCost ? current.storedCost ? "费用（含估算）" : "费用估算" : "总花费", current.priced ? fmtMoney(current.cost) : `${fmtMoney(current.cost)} · 部分统计`, { current: current.cost, previous: previous.cost }, !current.priced || !previous.priced)}
+          ${metricRow("计量记录", fmtCount(current.calls), { current: current.calls, previous: previous.calls })}
           ${metricRow("缓存命中率", current.cacheHitRate == null ? "—" : `${current.cacheHitRate}%`, { current: current.cacheHitRate, previous: previous.cacheHitRate })}
         </div>
         <div class="cltc-analytics-section">
           <div class="cltc-analytics-section-head">
-            <div><h3>趋势</h3><p>${preset === "today" ? "按小时" : Math.ceil((range.endMs - range.startMs) / 86_400_000) + 1 > 90 ? "按周" : "按日"}</p></div>
+            <div><h3>趋势</h3><p>${analyticsChartGranularityLabel(filtered, range)}</p></div>
             <div class="cltc-segmented cltc-segmented-compact" role="group" aria-label="趋势指标">
               <button type="button" data-analytics-metric="tokens" data-active="${String(metric === "tokens")}">Token</button>
               <button type="button" data-analytics-metric="cost" data-active="${String(metric === "cost")}">花费</button>
@@ -5117,8 +5229,8 @@ const VERSION = "0.7.9";
         </div>
         <div class="cltc-analytics-section">
           <div class="cltc-analytics-section-head"><div><h3>模型明细</h3><p>点击模型可联动筛选整页</p></div></div>
-          <div class="cltc-analytics-model-head"><span>模型</span><span>Token</span><span>模型调用</span><span>花费</span><span>占比</span></div>
-          <div class="cltc-analytics-models">${modelRows || `<div class="cltc-analytics-empty">当前范围内暂无真实模型调用。</div>`}</div>
+          <div class="cltc-analytics-model-head"><span>模型</span><span>Token</span><span>计量记录</span><span>花费</span><span>占比</span></div>
+          <div class="cltc-analytics-models">${modelRows || `<div class="cltc-analytics-empty">当前范围内暂无真实用量记录。</div>`}</div>
           ${current.models.length > 10 ? `<button type="button" class="cltc-analytics-expand" data-action="toggle-analytics-models">${state.analyticsModelsExpanded ? "收起" : `查看全部 ${current.models.length} 个模型`}</button>` : ""}
         </div>
       </section>
@@ -5933,20 +6045,31 @@ const VERSION = "0.7.9";
       return;
     }
     if (typeof client.checkGate === "function") {
-      const originalCheckGate = client.__codexLiveTokenCostOriginalCheckGate || client.checkGate.bind(client);
-      client.checkGate = (name, options) => (profileUnlockEnabled() && name === PROFILE_GATE_ID ? true : originalCheckGate(name, options));
-      client.__codexLiveTokenCostOriginalCheckGate = originalCheckGate;
+      const descriptor = Object.getOwnPropertyDescriptor(client, "checkGate");
+      const originalCheckGate = client.checkGate;
+      client.checkGate = function codexLiveTokenCostProfileCheckGate(name, options) {
+        return profileUnlockEnabled() && name === PROFILE_GATE_ID ? true : Reflect.apply(originalCheckGate, this, [name, options]);
+      };
+      registerProfilePropertyRestore(client, "checkGate", descriptor, Object.getOwnPropertyDescriptor(client, "checkGate"));
     }
     if (typeof client.getFeatureGate === "function") {
-      const originalGetFeatureGate = client.__codexLiveTokenCostOriginalGetFeatureGate || client.getFeatureGate.bind(client);
-      client.getFeatureGate = (name, options) => {
-        const gate = originalGetFeatureGate(name, options);
+      const descriptor = Object.getOwnPropertyDescriptor(client, "getFeatureGate");
+      const originalGetFeatureGate = client.getFeatureGate;
+      client.getFeatureGate = function codexLiveTokenCostProfileGetFeatureGate(name, options) {
+        const gate = Reflect.apply(originalGetFeatureGate, this, [name, options]);
         if (!profileUnlockEnabled() || name !== PROFILE_GATE_ID) return gate;
         return gate && typeof gate === "object" ? { ...gate, value: true } : gate;
       };
-      client.__codexLiveTokenCostOriginalGetFeatureGate = originalGetFeatureGate;
+      registerProfilePropertyRestore(client, "getFeatureGate", descriptor, Object.getOwnPropertyDescriptor(client, "getFeatureGate"));
     }
+    const markerDescriptor = Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfileGatePatched");
     client.__codexLiveTokenCostProfileGatePatched = VERSION;
+    registerProfilePropertyRestore(
+      client,
+      "__codexLiveTokenCostProfileGatePatched",
+      markerDescriptor,
+      Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfileGatePatched"),
+    );
     try {
       if (typeof client.$emt === "function") client.$emt({ name: "values_updated" });
     } catch {
@@ -5956,6 +6079,16 @@ const VERSION = "0.7.9";
 
   function patchProfileStatsigGate() {
     statsigClients().forEach(patchProfileStatsigClient);
+  }
+
+  function notifyProfileStatsigClients() {
+    for (const client of statsigClients()) {
+      try {
+        if (typeof client.$emt === "function") client.$emt({ name: "values_updated" });
+      } catch {
+        // Statsig event emission is best-effort.
+      }
+    }
   }
 
   function installProfileUsernameUppercaseUnlock() {
@@ -6114,62 +6247,83 @@ const VERSION = "0.7.9";
     if (!client || typeof client !== "object") return false;
     if (client.__codexLiveTokenCostProfileRequestPatch === VERSION) return true;
     if (typeof client.safeGet !== "function" && typeof client.safePatch !== "function") return false;
-    const originalSafeGet = client.__codexLiveTokenCostOriginalSafeGet || client.safeGet?.bind(client);
-    const originalSafePatch = client.__codexLiveTokenCostOriginalSafePatch || client.safePatch?.bind(client);
+    const originalSafeGet = client.safeGet;
+    const originalSafePatch = client.safePatch;
     if (typeof originalSafeGet === "function") {
+      const descriptor = Object.getOwnPropertyDescriptor(client, "safeGet");
       client.safeGet = async function codexLiveTokenCostProfileSafeGet(url, ...args) {
         if (profileUnlockEnabled() && isProfileUsageUrl(url)) return profileFetchBodyAsync("GET", null, url);
-        const response = await originalSafeGet(url, ...args);
+        const response = await Reflect.apply(originalSafeGet, this, [url, ...args]);
         return profileUnlockEnabled() && isProfileAccountsCheckUrl(url) ? spoofProfileAccountsCheckPayload(response) : response;
       };
-      client.__codexLiveTokenCostOriginalSafeGet = originalSafeGet;
+      registerProfilePropertyRestore(client, "safeGet", descriptor, Object.getOwnPropertyDescriptor(client, "safeGet"));
     }
     if (typeof originalSafePatch === "function") {
+      const descriptor = Object.getOwnPropertyDescriptor(client, "safePatch");
       client.safePatch = async function codexLiveTokenCostProfileSafePatch(url, options, ...args) {
         if (profileUnlockEnabled() && isProfileUsageUrl(url)) {
           applyLocalProfilePatch(options);
           return localProfileResponse();
         }
-        return originalSafePatch(url, options, ...args);
+        return Reflect.apply(originalSafePatch, this, [url, options, ...args]);
       };
-      client.__codexLiveTokenCostOriginalSafePatch = originalSafePatch;
+      registerProfilePropertyRestore(client, "safePatch", descriptor, Object.getOwnPropertyDescriptor(client, "safePatch"));
     }
+    const markerDescriptor = Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfileRequestPatch");
     client.__codexLiveTokenCostProfileRequestPatch = VERSION;
+    registerProfilePropertyRestore(
+      client,
+      "__codexLiveTokenCostProfileRequestPatch",
+      markerDescriptor,
+      Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfileRequestPatch"),
+    );
     return true;
   }
 
   function patchProfilePhotoUploadClient(client) {
     if (!client || (typeof client !== "object" && typeof client !== "function") || typeof client.post !== "function") return false;
     if (client.__codexLiveTokenCostProfilePhotoPatch === VERSION) return true;
-    const originalPost = client.__codexLiveTokenCostOriginalPost || client.post.bind(client);
+    const descriptor = Object.getOwnPropertyDescriptor(client, "post");
+    const originalPost = client.post;
     client.post = async function codexLiveTokenCostProfilePhotoPost(url, body, headers, ...args) {
       if (profileUnlockEnabled() && isProfilePhotoUrl(url)) {
         await applyLocalProfilePhotoUpload(body);
         return { status: 200, body: { asset_pointer: "local-profile-photo" }, headers: { "content-type": "application/json" } };
       }
-      return originalPost(url, body, headers, ...args);
+      return Reflect.apply(originalPost, this, [url, body, headers, ...args]);
     };
-    client.__codexLiveTokenCostOriginalPost = originalPost;
+    registerProfilePropertyRestore(client, "post", descriptor, Object.getOwnPropertyDescriptor(client, "post"));
+    const markerDescriptor = Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfilePhotoPatch");
     client.__codexLiveTokenCostProfilePhotoPatch = VERSION;
+    registerProfilePropertyRestore(
+      client,
+      "__codexLiveTokenCostProfilePhotoPatch",
+      markerDescriptor,
+      Object.getOwnPropertyDescriptor(client, "__codexLiveTokenCostProfilePhotoPatch"),
+    );
     return true;
   }
 
   async function installProfileRequestClientPatch() {
     if (!profileUnlockEnabled() || window.__CODEX_LIVE_TOKEN_COST_TEST__) return;
+    const generation = state.profilePatchGeneration;
     try {
       let patched = 0;
       for (const delay of [0, 200, 700, 1500]) {
         if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
-        if (!profileUnlockEnabled()) return;
+        if (!profilePatchGenerationCurrent(generation)) return;
         const module = await loadCodexAppModule("request-");
+        if (!profilePatchGenerationCurrent(generation)) return;
         for (const value of module?.Fct ? [module.Fct] : Object.values(module || {})) {
           if (patchProfileRequestClient(value)) patched += 1;
         }
         if (patched > 0) break;
       }
+      if (!profilePatchGenerationCurrent(generation)) return;
       window.__codexLiveTokenCostProfileRequestPatch = patched > 0 ? VERSION : "not-found";
       if (patched > 0) syncProfileUsageQueryCache();
     } catch (error) {
+      if (!profilePatchGenerationCurrent(generation)) return;
       window.__codexLiveTokenCostProfileRequestPatch = "error";
       window.__codexLiveTokenCostProfileRequestPatchError = error?.message || String(error);
     }
@@ -6177,9 +6331,10 @@ const VERSION = "0.7.9";
 
   async function installProfilePhotoUploadPatch() {
     if (!profileUnlockEnabled() || window.__CODEX_LIVE_TOKEN_COST_TEST__) return;
+    const generation = state.profilePatchGeneration;
     try {
       const module = await loadCodexAppModule("vscode-api-");
-      if (!profileUnlockEnabled()) return;
+      if (!profilePatchGenerationCurrent(generation)) return;
       let patched = 0;
       const values = Object.values(module || {});
       const photoClientExport = values.find((value) => {
@@ -6191,6 +6346,7 @@ const VERSION = "0.7.9";
         }
       });
       for (const value of photoClientExport ? [photoClientExport] : values) {
+        if (!profilePatchGenerationCurrent(generation)) return;
         try {
           const client = typeof value?.getInstance === "function" ? value.getInstance() : value;
           if (patchProfilePhotoUploadClient(client)) patched += 1;
@@ -6198,8 +6354,10 @@ const VERSION = "0.7.9";
           // Ignore non-client exports.
         }
       }
+      if (!profilePatchGenerationCurrent(generation)) return;
       window.__codexLiveTokenCostProfilePhotoPatch = patched > 0 ? VERSION : "not-found";
     } catch (error) {
+      if (!profilePatchGenerationCurrent(generation)) return;
       window.__codexLiveTokenCostProfilePhotoPatch = "error";
       window.__codexLiveTokenCostProfilePhotoPatchError = error?.message || String(error);
     }
@@ -6252,13 +6410,15 @@ const VERSION = "0.7.9";
 
   async function installProfileAuthContextPatch() {
     if (!profileUnlockEnabled() || window.__CODEX_LIVE_TOKEN_COST_TEST__) return;
+    const generation = state.profilePatchGeneration;
     try {
       const appUrl = await codexAppAssetUrl("app-initial-");
       const appSource = appUrl ? await fetch(appUrl).then((response) => (response.ok ? response.text() : "")) : "";
-      if (!profileUnlockEnabled()) return;
+      if (!profilePatchGenerationCurrent(generation)) return;
       const componentNames = profileUiComponentNamesFromSource(appSource);
       installProfileUiReadinessCoordinator(componentNames);
     } catch (error) {
+      if (!profilePatchGenerationCurrent(generation)) return;
       stopProfileUiReadinessCoordinator();
       state.profileSyntheticAuth = false;
       window.__codexLiveTokenCostProfileAuthPatch = "error";
@@ -6329,8 +6489,8 @@ const VERSION = "0.7.9";
     event.stopImmediatePropagation?.();
   }
 
-  function profileBridgeSendMessage(originalSend) {
-    const patchedSend = (message) => {
+  function profileBridgeSendMessage(originalSend, target) {
+    const patchedSend = function codexLiveTokenCostProfileBridgeSendMessage(message) {
       if (isProfileFetchMessage(message)) {
         rememberProfileRequestId(message.requestId);
         window.setTimeout(() => {
@@ -6338,22 +6498,30 @@ const VERSION = "0.7.9";
         }, 0);
         return Promise.resolve();
       }
-      return originalSend(message);
+      return Reflect.apply(originalSend, target || this, [message]);
     };
     patchedSend.__codexLiveTokenCostProfileUnlock = VERSION;
     return patchedSend;
   }
 
-  function patchProfileElectronBridge() {
-    const bridge = window.electronBridge;
+  function patchProfileElectronBridge(bridge = window.electronBridge) {
     if (!bridge || typeof bridge.sendMessageFromView !== "function" || bridge.sendMessageFromView.__codexLiveTokenCostProfileUnlock === VERSION) {
       return Boolean(bridge?.sendMessageFromView?.__codexLiveTokenCostProfileUnlock === VERSION);
     }
-    const originalSend = bridge.__codexLiveTokenCostOriginalSendMessageFromView || bridge.sendMessageFromView.bind(bridge);
-    const patchedSend = profileBridgeSendMessage(originalSend);
+    const sendDescriptor = Object.getOwnPropertyDescriptor(bridge, "sendMessageFromView");
+    const originalSend = bridge.sendMessageFromView;
+    const patchedSend = profileBridgeSendMessage(originalSend, bridge);
     try {
       bridge.sendMessageFromView = patchedSend;
+      registerProfilePropertyRestore(bridge, "sendMessageFromView", sendDescriptor, Object.getOwnPropertyDescriptor(bridge, "sendMessageFromView"));
+      const originalDescriptor = Object.getOwnPropertyDescriptor(bridge, "__codexLiveTokenCostOriginalSendMessageFromView");
       bridge.__codexLiveTokenCostOriginalSendMessageFromView = originalSend;
+      registerProfilePropertyRestore(
+        bridge,
+        "__codexLiveTokenCostOriginalSendMessageFromView",
+        originalDescriptor,
+        Object.getOwnPropertyDescriptor(bridge, "__codexLiveTokenCostOriginalSendMessageFromView"),
+      );
       return bridge.sendMessageFromView === patchedSend || bridge.sendMessageFromView.__codexLiveTokenCostProfileUnlock === VERSION;
     } catch {
       return false;
@@ -6363,8 +6531,8 @@ const VERSION = "0.7.9";
   function profileBridgeProxy(bridge) {
     if (!bridge || typeof bridge.sendMessageFromView !== "function" || typeof Proxy !== "function") return bridge;
     if (bridge.__codexLiveTokenCostProfileProxy === VERSION) return bridge;
-    const originalSend = bridge.__codexLiveTokenCostOriginalSendMessageFromView || bridge.sendMessageFromView.bind(bridge);
-    const patchedSend = profileBridgeSendMessage(originalSend);
+    const originalSend = bridge.__codexLiveTokenCostOriginalSendMessageFromView || bridge.sendMessageFromView;
+    const patchedSend = profileBridgeSendMessage(originalSend, bridge);
     const proxy = new Proxy(
       {},
       {
@@ -6394,12 +6562,22 @@ const VERSION = "0.7.9";
 
   function installElectronBridgeHook() {
     if (window.__codexLiveTokenCostBridgeHook === VERSION) return;
+    const bridge = window.electronBridge;
+    const descriptor = Object.getOwnPropertyDescriptor(window, "electronBridge");
+    if (descriptor?.configurable === false) {
+      patchProfileElectronBridge(bridge);
+      return;
+    }
+    const markerDescriptor = Object.getOwnPropertyDescriptor(window, "__codexLiveTokenCostBridgeHook");
     window.__codexLiveTokenCostBridgeHook = VERSION;
-    patchProfileElectronBridge();
-    let current = profileBridgeProxy(window.electronBridge);
+    registerProfilePropertyRestore(
+      window,
+      "__codexLiveTokenCostBridgeHook",
+      markerDescriptor,
+      Object.getOwnPropertyDescriptor(window, "__codexLiveTokenCostBridgeHook"),
+    );
+    let current = profileBridgeProxy(bridge);
     try {
-      const descriptor = Object.getOwnPropertyDescriptor(window, "electronBridge");
-      if (descriptor?.configurable === false) return;
       Object.defineProperty(window, "electronBridge", {
         configurable: true,
         enumerable: true,
@@ -6408,10 +6586,20 @@ const VERSION = "0.7.9";
         },
         set(value) {
           current = profileBridgeProxy(value);
-          window.setTimeout(patchProfileElectronBridge, 0);
+          const generation = state.profilePatchGeneration;
+          window.setTimeout(() => {
+            if (profilePatchGenerationCurrent(generation)) patchProfileElectronBridge(value);
+          }, 0);
         },
       });
-      if (current) window.setTimeout(patchProfileElectronBridge, 0);
+      registerProfilePropertyRestore(window, "electronBridge", descriptor, Object.getOwnPropertyDescriptor(window, "electronBridge"));
+      patchProfileElectronBridge(bridge);
+      if (current) {
+        const generation = state.profilePatchGeneration;
+        window.setTimeout(() => {
+          if (profilePatchGenerationCurrent(generation)) patchProfileElectronBridge(bridge);
+        }, 0);
+      }
     } catch {
       // If the preload owns a non-configurable bridge, the interval fallback still tries.
     }
@@ -6449,6 +6637,7 @@ const VERSION = "0.7.9";
   }
 
   function uninstallOfficialProfileUnlock() {
+    restoreProfilePatches();
     stopProfileUiReadinessCoordinator();
     stopProfileQueryCacheObserver();
     stopSidebarProfileIdentitySync();
@@ -6478,7 +6667,7 @@ const VERSION = "0.7.9";
       window.removeEventListener("message", handleProfileFetchResponseEvent, true);
       delete window.__codexLiveTokenCostProfileMessageIntercept;
     }
-    patchProfileStatsigGate();
+    notifyProfileStatsigClients();
   }
 
   function setProfileUnlockEnabled(value) {
@@ -9423,7 +9612,8 @@ const VERSION = "0.7.9";
       const url = requestUrl(input);
       const method = requestMethod(input, init);
       if (profileUnlockEnabled() && (isProfileUsageUrl(url) || isProfilePhotoUrl(url))) {
-        return new Response(JSON.stringify(await profileFetchBodyAsync(method, init?.body)), {
+        const body = method === "GET" ? null : await requestBody(input, init);
+        return new Response(JSON.stringify(await profileFetchBodyAsync(method, body, url)), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -9467,15 +9657,15 @@ const VERSION = "0.7.9";
         } catch {
           // Keep XHR behavior untouched.
         }
+        this.addEventListener?.("loadend", () => {
+          if (!isCodexApiUrl(this.__codexLiveTokenCostUrl)) return;
+          try {
+            inspectLocalPayload(this.responseText || "", "xhr");
+          } catch {
+            // Ignore unreadable XHR bodies.
+          }
+        }, { once: true });
       }
-      this.addEventListener?.("loadend", () => {
-        if (!isCodexApiUrl(this.__codexLiveTokenCostUrl)) return;
-        try {
-          inspectLocalPayload(this.responseText || "", "xhr");
-        } catch {
-          // Ignore unreadable XHR bodies.
-        }
-      });
       return originalSend.apply(this, args);
     };
     Xhr.prototype.__codexLiveTokenCostOriginalOpen = originalOpen;
@@ -9518,7 +9708,12 @@ const VERSION = "0.7.9";
     if (state.localMessageHandler) return;
     const previous = window.__codexLiveTokenCostMessageHandler;
     if (typeof previous === "function") window.removeEventListener?.("message", previous, true);
-    const handler = (event) => inspectLocalPayload(event.data, "message");
+    const handler = (event) => {
+      const payload = event?.data;
+      if (payload?.__codexLiveTokenCostProfileLocal) return;
+      if (payload?.type === "fetch-response" && /^cltc-helper-/.test(String(payload.requestId || ""))) return;
+      inspectLocalPayload(payload, "message");
+    };
     state.localMessageHandler = handler;
     window.__codexLiveTokenCostMessageHandler = handler;
     window.addEventListener?.("message", handler, true);
@@ -9674,8 +9869,17 @@ const VERSION = "0.7.9";
   }
 
   async function syncCodexSessionUsageFromHelper(options = {}) {
-    if (state.codexSessionSyncInFlight) return state.codexSessionSyncPromise || { ok: false, skipped: true, refreshing: true };
+    if (state.codexSessionSyncInFlight) {
+      if (!options.refresh) return state.codexSessionSyncPromise || { ok: false, skipped: true, refreshing: true };
+      const inFlightPromise = state.codexSessionSyncPromise;
+      if (inFlightPromise) await inFlightPromise;
+      if (state.codexSessionSyncInFlight) return { ok: false, skipped: true, refreshing: true };
+    }
     if (typeof window.fetch !== "function") return { ok: false, skipped: true, helperUnavailable: true };
+    const syncedAt = toCount(state.codexSessionSyncAt);
+    if (!options.refresh && syncedAt && Date.now() - syncedAt < CODEX_SESSION_SYNC_MIN_INTERVAL_MS) {
+      return { ok: true, skipped: true, cached: true, source: "codex-session" };
+    }
     state.codexSessionSyncInFlight = true;
     state.codexSessionSyncPromise = (async () => { try {
       const payload = await helperJsonUntilReady(
@@ -9687,7 +9891,9 @@ const VERSION = "0.7.9";
       const payloadError = normalizeText(payload?.error, 500);
       if (payload?.ok !== true || payloadError) return { ok: false, helperUnavailable: true, error: payloadError || "codex_session_sync_failed" };
       const turns = Array.isArray(payload?.turns) ? payload.turns : [];
-      return { ok: true, ...importLocalUsageTurns(turns, { replaceSource: "codex-session" }), source: "codex-session" };
+      const result = importLocalUsageTurns(turns, { replaceSource: "codex-session" });
+      state.codexSessionSyncAt = Date.now();
+      return { ok: true, ...result, source: "codex-session" };
     } catch (error) {
       return { ok: false, helperUnavailable: true, error: error?.message || String(error) };
     } })();
@@ -9696,13 +9902,18 @@ const VERSION = "0.7.9";
   }
 
   function refreshProfileData(options = {}) {
-    if (state.profileDataRefreshPromise) return state.profileDataRefreshPromise;
+    if (state.profileDataRefreshPromise) {
+      if (!options.force || state.profileDataRefreshForce) return state.profileDataRefreshPromise;
+      const inFlightPromise = state.profileDataRefreshPromise;
+      return inFlightPromise.then(() => refreshProfileData(options));
+    }
     const attemptedAt = toCount(state.profileDataRefreshAttemptAt);
     if (!options.force && attemptedAt && Date.now() - attemptedAt < PROFILE_DATA_REFRESH_MIN_INTERVAL_MS) {
       return Promise.resolve({ ok: false, skipped: true });
     }
     state.profileDataRefreshAttemptAt = Date.now();
-    const refreshOptions = { ...options, refresh: true };
+    const refreshOptions = { ...options, refresh: options.force === true };
+    state.profileDataRefreshForce = refreshOptions.refresh;
     state.profileDataRefreshPromise = syncCcSwitchUsageFromHelper(refreshOptions)
       .then(async (ccSwitch) => {
         const codexSessions = await syncCodexSessionUsageFromHelper(refreshOptions);
@@ -9713,6 +9924,7 @@ const VERSION = "0.7.9";
       .catch((error) => ({ ok: false, error: error?.message || String(error) }))
       .finally(() => {
         state.profileDataRefreshPromise = null;
+        state.profileDataRefreshForce = false;
       });
     return state.profileDataRefreshPromise;
   }
@@ -9774,6 +9986,7 @@ const VERSION = "0.7.9";
 
   function destroy() {
     state.started = false;
+    uninstallOfficialProfileUnlock();
     stopProfileUiReadinessCoordinator();
     stopSidebarProfileIdentitySync();
     if (state.renderTimer) window.clearTimeout(state.renderTimer);
@@ -9812,6 +10025,7 @@ const VERSION = "0.7.9";
     state.profileDataRefreshAttemptAt = 0;
     state.profileDataRefreshAt = 0;
     state.profileDataRefreshPromise = null;
+    state.profileDataRefreshForce = false;
     state.ccSwitchSyncGeneration += 1;
     state.ccSwitchSyncInFlight = false;
     state.ccSwitchSyncPromise = null;
@@ -9909,6 +10123,7 @@ const VERSION = "0.7.9";
       profileLedgerUpsertTurn,
       profileLedgerObserveLocalTurn,
       profileLedgerActivity,
+      profileRollupDaysForTurn,
       profileLedgerTurns: () => ensureProfileLedgerLoaded().turns,
       profileDisplayedBucket,
       saveProfileLedgerSnapshot,
@@ -9974,6 +10189,8 @@ const VERSION = "0.7.9";
       migrateLegacyLocationSessionTurns,
       currentSessionTurns,
       localProfileThreadCount,
+      localProfileDailyUsageBuckets,
+      localProfileStreakStats,
       trimLocalLedger,
       compactLocalLedger,
       localUsageArchiveTurns,
@@ -10029,6 +10246,7 @@ const VERSION = "0.7.9";
       saveProfileUnlockEnabled,
       setProfileUnlockEnabled,
       installLocalFetchCapture,
+      requestBody,
       isProfileUsageUrl,
       isCodexApiUrl,
       hubVisible,

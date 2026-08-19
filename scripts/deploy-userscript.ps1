@@ -15,9 +15,31 @@ if (-not (Test-Path -LiteralPath $source)) {
 }
 
 New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
-Copy-Item -LiteralPath $source -Destination $target -Force
+$temp = Join-Path $targetDir (".$([System.IO.Path]::GetFileName($target)).$([guid]::NewGuid().ToString('N')).tmp")
+$backup = Join-Path $targetDir (".$([System.IO.Path]::GetFileName($target)).$([guid]::NewGuid().ToString('N')).bak")
+try {
+  Copy-Item -LiteralPath $source -Destination $temp -Force
 
-$sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()
+  $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()
+  $tempHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $temp).Hash.ToLowerInvariant()
+  if ($sourceHash -ne $tempHash) {
+    throw "Temporary userscript hash does not match source"
+  }
+
+  if (Test-Path -LiteralPath $target) {
+    [System.IO.File]::Replace($temp, $target, $backup)
+  } else {
+    [System.IO.File]::Move($temp, $target)
+  }
+} finally {
+  if (Test-Path -LiteralPath $temp) {
+    Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path -LiteralPath $backup) {
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+  }
+}
+
 $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
 $matched = $sourceHash -eq $targetHash
 

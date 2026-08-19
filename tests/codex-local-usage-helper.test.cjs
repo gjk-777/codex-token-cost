@@ -7,6 +7,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const helper = require("../scripts/codex-local-usage-helper.cjs");
+assert.equal(typeof helper.collectCodexSessionTurnsInChild, "function");
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -158,21 +159,51 @@ con.close()
       JSON.stringify({ type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { call_id: "mcp-2", server: "codegraph" } } }),
     ].join("\n"));
     fs.writeFileSync(path.join(sessionsRoot, "unsupported.jsonl"), [
-      JSON.stringify({ type: "session_meta", payload: { id: "session-cli", originator: "codex-tui", source: "cli" } }),
-      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-cli" } }),
+      JSON.stringify({ type: "session_meta", payload: { id: "session-unsupported", originator: "claudian", source: "vscode" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-unsupported" } }),
       JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 999, output_tokens: 1, total_tokens: 1000 } } } }),
     ].join("\n"));
-    const sessionStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "sessions-cache.json") });
+    const tuiSessionFile = path.join(sessionsRoot, "codex-tui.jsonl");
+    fs.writeFileSync(tuiSessionFile, [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-tui", originator: "codex-tui", source: "cli" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "thread_settings_applied", thread_settings: { model: "gpt-5.6-sol", reasoning_effort: "high", service_tier: "priority" } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-tui", started_at: "2026-08-01T00:00:05.000Z" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 50, output_tokens: 10, cached_input_tokens: 20, total_tokens: 60 } } } }),
+      JSON.stringify({ timestamp: "2026-08-01T00:00:06.000Z", type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { server: "codegraph" } } }),
+      JSON.stringify({ timestamp: "2026-08-01T00:00:07.000Z", type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { server: "codegraph" } } }),
+      JSON.stringify({ timestamp: "2026-08-01T00:00:07.000Z", type: "event_msg", payload: { type: "mcp_tool_call_end", invocation: { server: "codegraph" } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_complete", turn_id: "turn-tui", completed_at: "2026-08-01T00:00:15.000Z" } }),
+    ].join("\n"));
+    fs.writeFileSync(path.join(sessionsRoot, "codex-exec.jsonl"), [
+      JSON.stringify({ type: "session_meta", payload: { id: "session-exec", originator: "codex_exec", source: "exec" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "task_started", turn_id: "turn-exec", started_at: "2026-08-01T00:01:00.000Z", model: "gpt-5.6-sol" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 25, output_tokens: 5, cached_input_tokens: 10, total_tokens: 30 } } } }),
+    ].join("\n"));
+    const sessionsCachePath = path.join(root, "sessions-cache.json");
+    const tuiStat = fs.statSync(tuiSessionFile);
+    fs.writeFileSync(sessionsCachePath, JSON.stringify({
+      version: 2,
+      files: { [path.resolve(tuiSessionFile)]: { size: tuiStat.size, mtimeMs: tuiStat.mtimeMs, turns: [] } },
+    }));
+    const sessionStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: sessionsCachePath });
     assert.equal(sessionStats.ok, true);
-    assert.equal(sessionStats.turns.length, 1);
-    assert.deepEqual(sessionStats.turns[0].usage, { input: 140, output: 15, cached: 30, total: 155 });
-    assert.equal(sessionStats.turns[0].platform, "codex_vscode");
-    assert.equal(sessionStats.turns[0].fastMode, true);
-    assert.equal(sessionStats.turns[0].invocations.some((item) => item.plugin_id === "node_repl"), true);
-    assert.equal(sessionStats.turns[0].invocations.some((item) => item.plugin_id === "codegraph"), true);
-    assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "diagnose"), true);
-    assert.equal(sessionStats.turns[0].invocations.some((item) => item.skill_id === "hello-debug"), true);
-    assert.equal(sessionStats.turns[0].invocations.find((item) => item.skill_id === "hello-debug")?.owner_plugin_id, "helloagents");
+    assert.equal(sessionStats.turns.length, 3);
+    const vscodeTurn = sessionStats.turns.find((turn) => turn.sessionKey === "session-vscode");
+    assert.deepEqual(vscodeTurn.usage, { input: 140, output: 15, cached: 30, total: 155 });
+    assert.equal(vscodeTurn.platform, "codex_vscode");
+    assert.equal(vscodeTurn.fastMode, true);
+    assert.equal(vscodeTurn.invocations.some((item) => item.plugin_id === "node_repl"), true);
+    assert.equal(vscodeTurn.invocations.some((item) => item.plugin_id === "codegraph"), true);
+    assert.equal(vscodeTurn.invocations.some((item) => item.skill_id === "diagnose"), true);
+    assert.equal(vscodeTurn.invocations.find((item) => item.skill_id === "hello-debug")?.owner_plugin_id, "helloagents");
+    const tuiTurn = sessionStats.turns.find((turn) => turn.sessionKey === "session-tui");
+    assert.deepEqual(tuiTurn?.usage, { input: 50, output: 10, cached: 20, total: 60 });
+    assert.equal(tuiTurn?.model, "gpt-5.6-sol");
+    assert.equal(tuiTurn?.effort, "high");
+    assert.equal(tuiTurn?.fastMode, true);
+    assert.equal(tuiTurn?.durationStatus, "completed");
+    assert.equal(tuiTurn?.invocations.filter((item) => item.plugin_id === "codegraph").length, 2);
+    assert.deepEqual(sessionStats.turns.find((turn) => turn.sessionKey === "session-exec")?.usage, { input: 25, output: 5, cached: 10, total: 30 });
     const skillOnlyFile = path.join(sessionsRoot, "skill-only.jsonl");
     fs.writeFileSync(skillOnlyFile, [
       JSON.stringify({ type: "session_meta", payload: { id: "session-skill-only", originator: "codex_vscode" } }),
@@ -190,12 +221,19 @@ con.close()
       JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 200, output_tokens: 1, cached_input_tokens: 2, total_tokens: 201 } } } }),
     ].join("\n"));
     const expandedStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "expanded-sessions-cache.json") });
-    assert.equal(expandedStats.turns.length, 3);
+    assert.equal(expandedStats.turns.length, 5);
     assert.equal(expandedStats.turns.some((turn) => turn.sessionKey === "session-skill-only" && turn.usage.total === 0), true);
     assert.equal(expandedStats.turns.some((turn) => turn.sessionKey === "session-other" && turn.turnId === "turn-1"), true);
     assert.deepEqual(expandedStats.turns.find((turn) => turn.sessionKey === "session-vscode").usage, { input: 200, output: 15, cached: 30, total: 215 });
+    assert.equal(expandedStats.turns.some((turn) => turn.sessionKey === "session-tui" && turn.platform === "codex-tui"), true);
     const cachedSessionStats = await helper.collectCodexSessionTurns({ codexSessionsPath: sessionsRoot, codexSessionsCachePath: path.join(root, "expanded-sessions-cache.json") });
     assert.equal(cachedSessionStats.reparsed, 0);
+    const childSessionStats = await helper.collectCodexSessionTurnsInChild({
+      codexSessionsPath: sessionsRoot,
+      codexSessionsCachePath: path.join(root, "child-sessions-cache.json"),
+    });
+    assert.equal(childSessionStats.ok, true);
+    assert.equal(childSessionStats.turns.length, 5);
     const splitBaselineFile = path.join(sessionsRoot, "split-baseline.jsonl");
     fs.writeFileSync(splitBaselineFile, [
       JSON.stringify({ type: "session_meta", payload: { id: "session-split", originator: "codex_vscode" } }),
@@ -210,7 +248,12 @@ con.close()
     assert.equal(helper.isLoopbackHost("127.0.0.1"), true);
     assert.equal(helper.isLoopbackHost("::1"), true);
     assert.equal(helper.isLoopbackHost("localhost"), false);
+    assert.deepEqual(helper.parseArgs(["--serve", "--host", "::1", "--port", "17889"]), { serve: true, host: "::1", port: 17889 });
+    assert.throws(() => helper.parseArgs(["--port", "not-a-port"]), /port must be an integer/);
+    assert.throws(() => helper.parseArgs(["--port"]), /Missing value/);
+    assert.throws(() => helper.parseArgs(["--unexpected"]), /Unknown argument/);
     assert.throws(() => helper.startServer({ host: "0.0.0.0" }), /loopback/);
+    assert.throws(() => helper.startServer({ port: 0 }), /port must be an integer/);
 
     let eventLoopTicked = false;
     const timedPython = helper.runPython("import time\ntime.sleep(1)\n", ccSwitchDb, { pythonTimeoutMs: 50 });
@@ -230,6 +273,8 @@ con.close()
     const helperSource = fs.readFileSync(path.join(__dirname, "..", "scripts", "codex-local-usage-helper.cjs"), "utf8");
     assert.match(helperSource, /const PYTHON_TIMEOUT_MS = 30000;/);
     assert.match(helperSource, /new URL\(req\.url \|\| "\/", "http:\/\/localhost"\)/);
+    assert.match(helperSource, /sqlite3\.connect\(db_uri, uri=True\)/);
+    assert.match(helperSource, /\?mode=ro/);
 
     const serverDb = path.join(root, "helper-meta.json");
     const port = await freePort();
@@ -270,23 +315,25 @@ con.close()
       assert.equal(concurrent[0].body.refreshing, true);
       assert.equal(concurrent[1].body.refreshing, true);
       assert.equal(refreshCount, 1);
-      const ready = await waitForTurnCount(port, 2);
-      assert.equal(ready.status, 200);
-      assert.equal(ready.body.turns.length, 2);
-      assert.equal(ready.body.turns[1].durationSec, 0);
-      assert.equal(Object.hasOwn(ready.body, "stats"), false);
-      const sessionFirst = await requestJson(port, "/codex-sessions/turns?refresh=1");
+       const ready = await waitForTurnCount(port, 2);
+       assert.equal(ready.status, 200);
+       assert.equal(ready.body.turns.length, 2);
+       assert.equal(ready.body.turns[1].durationSec, 0);
+       assert.equal(Object.hasOwn(ready.body, "stats"), false);
+       const refreshedStats = await requestJson(port, "/stats");
+       assert.equal(refreshedStats.body.cached, true);
+       const sessionFirst = await requestJson(port, "/codex-sessions/turns?refresh=1");
       assert.equal(sessionFirst.status, 202);
       const sessionReady = await (async () => {
         for (let attempt = 0; attempt < 40; attempt += 1) {
           const response = await requestJson(port, "/codex-sessions/turns");
-          if (response.body.turns?.length === 1 && response.body.refreshing === false) return response;
+          if (response.body.turns?.length === 3 && response.body.refreshing === false) return response;
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
         return requestJson(port, "/codex-sessions/turns");
       })();
       assert.equal(sessionReady.status, 200);
-      assert.equal(sessionReady.body.turns[0].turnId, "turn-1");
+       assert.equal(sessionReady.body.turns.find((turn) => turn.sessionKey === "session-vscode")?.turnId, "turn-1");
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -316,8 +363,11 @@ con.close()
     assert.match(launcher, /\$helperArgument = '"' \+ \$helper \+ '"'/);
     assert.match(launcher, /-ArgumentList @\(\$helperArgument,/);
     assert.match(launcher, /"--host", \$ListenHost, "--port", \$Port/);
-    assert.match(launcher, /Invoke-RestMethod[\s\S]*\/health/);
-    assert.match(launcher, /\$health\.source -ne "codex-local-usage-helper"/);
+    assert.match(launcher, /\$healthUri = "http:\/\/\$\{hostForUri\}:\$Port\/health"/);
+    assert.match(launcher, /Invoke-RestMethod -Uri \$healthUri/);
+    assert.match(launcher, /\$health\.source -eq "codex-local-usage-helper"/);
+    assert.match(launcher, /-RedirectStandardError \$stderrLog/);
+    assert.match(launcher, /for \(\$attempt = 0; \$attempt -lt 20/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

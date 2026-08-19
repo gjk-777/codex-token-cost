@@ -6,7 +6,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
-const { spawn } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 
 const DEFAULT_PORT = 17888;
 const DEFAULT_HOST = "127.0.0.1";
@@ -18,10 +18,12 @@ const CC_SWITCH_ERROR_CACHE_TTL_MS = 5000;
 const PYTHON_TIMEOUT_MS = 30000;
 const PYTHON_MAX_BUFFER = 16 * 1024 * 1024;
 const DEFAULT_CODEX_SESSIONS_PATH = path.join(os.homedir(), ".codex", "sessions");
-const CODEX_SESSION_CACHE_TTL_MS = 60000;
+const CODEX_SESSION_CACHE_TTL_MS = 120000;
 const CODEX_SESSION_CACHE_MAX_BYTES = 64 * 1024 * 1024;
-const CODEX_SESSION_CACHE_VERSION = 2;
-const SUPPORTED_CODEX_ORIGINATORS = new Set(["Codex Desktop", "codex_vscode"]);
+const CODEX_SESSION_CACHE_VERSION = 3;
+const CODEX_SESSION_CHILD_TIMEOUT_MS = 60000;
+const CODEX_SESSION_CHILD_MAX_BUFFER = 16 * 1024 * 1024;
+const SUPPORTED_CODEX_ORIGINATORS = new Set(["Codex Desktop", "codex_vscode", "codex-tui", "codex_exec"]);
 
 function normalizeText(value, max = 120) {
   return String(value ?? "").trim().replace(/\s+/g, " ").slice(0, max);
@@ -75,10 +77,33 @@ function sessionUsageDelta(previous, current) {
   return delta;
 }
 
-function sessionInvocation(value) {
+function sessionFastMode(value) {
+  const explicit = value?.fast_mode ?? value?.fastMode;
+  if (typeof explicit === "boolean") return explicit;
+  const tier = String(value?.service_tier || value?.serviceTier || value?.speed_tier || value?.speedTier || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (["fast", "fast_mode", "priority"].includes(tier)) return true;
+  if (["default", "standard", "normal", "regular"].includes(tier)) return false;
+  return null;
+}
+
+function applySessionSettings(turn, value) {
+  if (!turn || !value || typeof value !== "object") return;
+  const model = String(value.model || value.model_name || value.modelName || "").trim();
+  const effort = String(value.reasoning_effort || value.reasoningEffort || value.effort || "").trim();
+  const fastMode = sessionFastMode(value);
+  if (model) turn.model = model;
+  if (effort) turn.effort = effort;
+  if (typeof fastMode === "boolean") turn.fastMode = fastMode;
+}
+
+function sessionInvocation(value, fallbackId = "") {
   const server = String(value?.server || value?.server_name || value?.serverName || value?.plugin_name || value?.pluginName || "").trim().replace(/^\$+/, "");
   if (!server) return null;
-  const id = String(value?.call_id || value?.callId || value?.id || "").trim();
+  const explicitId = String(value?.call_id || value?.callId || value?.id || "").trim();
+  const id = explicitId || (fallbackId ? `${fallbackId}:${server}` : "");
   return { type: "plugin", plugin_id: server, plugin_name: server, ...(id ? { invocationId: id } : {}) };
 }
 
@@ -147,28 +172,34 @@ async function parseCodexSessionFile(filePath) {
   let source = "";
   let currentTurnId = "";
   let previousUsage = null;
+  let sessionSettings = {};
+  let eventSequence = 0;
   const turns = new Map();
   const ensureTurn = (turnId, timestamp = Date.now()) => {
     const id = String(turnId || "").trim();
     if (!id) return null;
-    if (!turns.has(id)) turns.set(id, {
-      turnId: id,
-      sessionKey: sessionId || path.resolve(filePath),
-      threadKey: sessionId,
-      threadAttributionStatus: "reliable",
-      source: "codex-session",
-      importSource: "codex-session",
-      platform: originator || source || "codex",
-      model: "未知",
-      effort: "",
-      fastMode: null,
-      usage: { input: 0, output: 0, cached: 0, total: 0 },
-      calls: 0,
-      invocations: [],
-      startedAt: timestamp,
-      observedAt: timestamp,
-      completedAt: 0,
-    });
+    if (!turns.has(id)) {
+      const turn = {
+        turnId: id,
+        sessionKey: sessionId || path.resolve(filePath),
+        threadKey: sessionId,
+        threadAttributionStatus: "reliable",
+        source: "codex-session",
+        importSource: "codex-session",
+        platform: originator || source || "codex",
+        model: "未知",
+        effort: "",
+        fastMode: null,
+        usage: { input: 0, output: 0, cached: 0, total: 0 },
+        calls: 0,
+        invocations: [],
+        startedAt: timestamp,
+        observedAt: timestamp,
+        completedAt: 0,
+      };
+      applySessionSettings(turn, sessionSettings);
+      turns.set(id, turn);
+    }
     return turns.get(id);
   };
   const addInvocation = (turn, invocation) => {
@@ -178,6 +209,7 @@ async function parseCodexSessionFile(filePath) {
   };
   try {
     for await (const line of reader) {
+      eventSequence += 1;
       const event = safeJsonParse(line, null);
       if (!event || typeof event !== "object") continue;
       const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
@@ -200,17 +232,18 @@ async function parseCodexSessionFile(filePath) {
         }
       }
       const eventType = payload.type || "";
+      if (event.type === "event_msg" && eventType === "thread_settings_applied") {
+        const settings = payload.thread_settings || payload.threadSettings || {};
+        if (settings && typeof settings === "object") sessionSettings = { ...sessionSettings, ...settings };
+        const settingsTurnId = String(payload.turn_id || payload.turnId || "").trim();
+        if (settingsTurnId) applySessionSettings(ensureTurn(settingsTurnId, event.timestamp), sessionSettings);
+      }
       if (event.type === "turn_context" || (event.type === "event_msg" && eventType === "task_started")) {
         currentTurnId = String(payload.turn_id || payload.turnId || currentTurnId).trim();
         const turn = ensureTurn(currentTurnId, sessionTimestamp(payload.started_at || event.timestamp));
         if (turn) {
           turn.startedAt = Math.min(turn.startedAt || Date.now(), sessionTimestamp(payload.started_at || event.timestamp));
-          turn.model = String(payload.model || payload.model_name || payload.modelName || turn.model || "未知").trim() || "未知";
-          turn.effort = String(payload.reasoning_effort || payload.reasoningEffort || payload.effort || turn.effort || "").trim();
-          const tier = String(payload.service_tier || payload.serviceTier || payload.speed_tier || "").toLowerCase();
-          if (typeof payload.fast_mode === "boolean") turn.fastMode = payload.fast_mode;
-          else if (typeof payload.fastMode === "boolean") turn.fastMode = payload.fastMode;
-          else if (tier) turn.fastMode = ["fast", "fast_mode", "priority"].includes(tier.replace(/[\s-]+/g, "_"));
+          applySessionSettings(turn, payload);
         }
       }
       if (event.type === "event_msg" && eventType === "task_complete") {
@@ -243,7 +276,10 @@ async function parseCodexSessionFile(filePath) {
         }
       }
       const turn = ensureTurn(eventTurnId, event.timestamp);
-      if (event.type === "event_msg" && eventType === "mcp_tool_call_end") addInvocation(turn, sessionInvocation(payload.invocation || payload));
+      if (event.type === "event_msg" && eventType === "mcp_tool_call_end") {
+        const fallbackId = `mcp:${normalizeText(event.timestamp, 60) || `event-${eventSequence}`}`;
+        addInvocation(turn, sessionInvocation(payload.invocation || payload, fallbackId));
+      }
       if (event.type === "response_item" && eventType === "custom_tool_call") {
         for (const invocation of sessionSkillInvocations(payload)) addInvocation(turn, invocation);
       }
@@ -265,6 +301,7 @@ async function parseCodexSessionFile(filePath) {
       finishedAt: new Date(turn.completedAt || turn.observedAt).toISOString(),
       durationMs: Math.max(0, (turn.completedAt || turn.observedAt) - (turn.startedAt || turn.observedAt)),
       durationSec: Math.round(Math.max(0, (turn.completedAt || turn.observedAt) - (turn.startedAt || turn.observedAt)) / 1000),
+      durationStatus: turn.completedAt ? "completed" : "incomplete",
       callCount: Math.max(1, turn.calls),
       ...(turn.cacheWriteTokens > 0 ? { cacheWriteTokens: turn.cacheWriteTokens, cacheWriteAvailable: true } : {}),
     }));
@@ -278,17 +315,29 @@ async function collectCodexSessionTurns(options = {}) {
   const reusableCache = oldCache.version === CODEX_SESSION_CACHE_VERSION ? oldCache : { files: {} };
   const nextFiles = {};
   let reparsed = 0;
+  let skipped = 0;
   for (const filePath of await listJsonlFiles(sessionsPath)) {
-    let stat;
-    try { stat = await fs.promises.stat(filePath); } catch { continue; }
     const key = path.resolve(filePath);
     const cached = reusableCache.files?.[key];
+    let stat;
+    try {
+      stat = await fs.promises.stat(filePath);
+    } catch {
+      skipped += 1;
+      if (cached && Array.isArray(cached.turns)) nextFiles[key] = cached;
+      continue;
+    }
     if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs && Array.isArray(cached.turns)) {
       nextFiles[key] = cached;
       continue;
     }
-    nextFiles[key] = { size: stat.size, mtimeMs: stat.mtimeMs, turns: await parseCodexSessionFile(filePath) };
-    reparsed += 1;
+    try {
+      nextFiles[key] = { size: stat.size, mtimeMs: stat.mtimeMs, turns: await parseCodexSessionFile(filePath) };
+      reparsed += 1;
+    } catch {
+      skipped += 1;
+      if (cached && Array.isArray(cached.turns)) nextFiles[key] = cached;
+    }
   }
   const cachePayload = { version: CODEX_SESSION_CACHE_VERSION, updated_at: new Date().toISOString(), files: nextFiles };
   if (Buffer.byteLength(JSON.stringify(cachePayload)) <= CODEX_SESSION_CACHE_MAX_BYTES) writeJson(cachePath, cachePayload);
@@ -327,7 +376,38 @@ async function collectCodexSessionTurns(options = {}) {
     });
   }
   const turns = Array.from(byTurnId.values()).sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)) || left.turnId.localeCompare(right.turnId));
-  return { ok: true, source: "codex-session", sessions_path: sessionsPath, turns, imported: turns.length, skipped: 0, reparsed, updated_at: new Date().toISOString() };
+  return { ok: true, source: "codex-session", sessions_path: sessionsPath, turns, imported: turns.length, skipped, reparsed, updated_at: new Date().toISOString() };
+}
+
+function collectCodexSessionTurnsInChild(options = {}) {
+  const args = [__filename, "--collect-codex-sessions"];
+  if (options.codexSessionsPath) args.push("--codex-sessions", String(options.codexSessionsPath));
+  if (options.codexSessionsCachePath) args.push("--codex-sessions-cache", String(options.codexSessionsCachePath));
+  if (options.dbPath) args.push("--db", String(options.dbPath));
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      args,
+      {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: Math.max(1, Number(options.codexSessionsChildTimeoutMs || CODEX_SESSION_CHILD_TIMEOUT_MS)),
+        maxBuffer: CODEX_SESSION_CHILD_MAX_BUFFER,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(normalizeText(stderr || error.message || "codex_session_child_failed", 500)));
+          return;
+        }
+        const payload = safeJsonParse(stdout, null);
+        if (!payload || typeof payload !== "object") {
+          reject(new Error("codex_session_child_invalid_output"));
+          return;
+        }
+        resolve(payload);
+      },
+    );
+  });
 }
 
 function runPython(script, dbPath, options = {}, executable = process.env.PYTHON || "python") {
@@ -408,8 +488,11 @@ async function collectCcSwitchTurns(options = {}) {
   }
   const script = String.raw`
 import json, sqlite3, sys
+from pathlib import Path
 db = sys.argv[1]
-con = sqlite3.connect(db)
+db_uri = Path(db).resolve().as_uri() + "?mode=ro"
+con = sqlite3.connect(db_uri, uri=True)
+con.execute("PRAGMA query_only = ON")
 con.row_factory = sqlite3.Row
 cur = con.cursor()
 def table_exists(name):
@@ -600,12 +683,14 @@ function sendJson(res, status, body, origin = "") {
 function startServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
   if (!isLoopbackHost(host)) throw new Error("Helper host must be a loopback address: 127.0.0.1 or ::1");
-  const port = Number(options.port || DEFAULT_PORT);
+  const port = options.port === undefined ? DEFAULT_PORT : Number(options.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("Helper port must be an integer from 1 to 65535");
+  }
   const dbPath = options.dbPath || DEFAULT_DB_PATH;
-  let cached = readJson(dbPath, null);
-  let cachedAt = cached?.updated_at ? Date.parse(cached.updated_at) : 0;
-  let ccSwitchCached = null;
-  let ccSwitchCachedAt = 0;
+  const diskCache = readJson(dbPath, null);
+  let ccSwitchCached = diskCache?.cc_switch && typeof diskCache.cc_switch === "object" ? diskCache.cc_switch : null;
+  let ccSwitchCachedAt = Date.parse(ccSwitchCached?.updated_at || diskCache?.updated_at || "") || 0;
   let ccSwitchRefreshing = false;
   let codexSessionsCached = null;
   let codexSessionsCachedAt = 0;
@@ -641,7 +726,11 @@ function startServer(options = {}) {
     codexSessionsRefreshing = true;
     setTimeout(async () => {
       try {
-        codexSessionsCached = await collectCodexSessionTurns(options);
+        try {
+          codexSessionsCached = await collectCodexSessionTurnsInChild(options);
+        } catch {
+          codexSessionsCached = await collectCodexSessionTurns(options);
+        }
         codexSessionsCachedAt = Date.now();
       } catch (error) {
         codexSessionsCached = {
@@ -680,7 +769,7 @@ function startServer(options = {}) {
       const status = ccSwitchStatus(options);
       sendJson(res, 200, {
         ...status,
-        cached: Boolean(cached?.cc_switch?.ok),
+        cached: Boolean(ccSwitchCached?.ok),
         refreshing: ccSwitchRefreshing,
         codex_sessions_available: fs.existsSync(options.codexSessionsPath || DEFAULT_CODEX_SESSIONS_PATH),
         codex_sessions_cached: Boolean(codexSessionsCached?.ok),
@@ -721,6 +810,11 @@ function startServer(options = {}) {
     }
     sendJson(res, 404, { ok: false, error: "not_found" }, origin);
   });
+  server.on("error", (error) => {
+    console.error(`codex-local-usage-helper failed to listen on http://${host}:${port}: ${error?.message || error}`);
+    if (typeof options.onListenError === "function") options.onListenError(error);
+    else if (require.main === module) process.exitCode = 1;
+  });
   server.listen(port, host, () => {
     console.log(`codex-local-usage-helper listening on http://${host}:${port}`);
   });
@@ -731,23 +825,48 @@ function parseArgs(argv) {
   const options = {};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--port") options.port = Number(argv[++i]);
-    else if (arg === "--host") options.host = argv[++i];
-    else if (arg === "--db") options.dbPath = argv[++i];
-    else if (arg === "--cc-switch-db") options.ccSwitchDbPath = argv[++i];
-    else if (arg === "--codex-sessions") options.codexSessionsPath = argv[++i];
+    const valueFor = (name) => {
+      const value = argv[++i];
+      if (value === undefined || value === "") throw new Error(`Missing value for ${name}`);
+      return value;
+    };
+    if (arg === "--port") options.port = Number(valueFor(arg));
+    else if (arg === "--host") options.host = valueFor(arg);
+    else if (arg === "--db") options.dbPath = valueFor(arg);
+    else if (arg === "--cc-switch-db") options.ccSwitchDbPath = valueFor(arg);
+    else if (arg === "--codex-sessions") options.codexSessionsPath = valueFor(arg);
+    else if (arg === "--codex-sessions-cache") options.codexSessionsCachePath = valueFor(arg);
+    else if (arg === "--collect-codex-sessions") options.collectCodexSessions = true;
     else if (arg === "--serve") options.serve = true;
+    else throw new Error(`Unknown argument: ${arg}`);
+  }
+  if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535)) {
+    throw new Error("Helper port must be an integer from 1 to 65535");
   }
   return options;
 }
 
 module.exports = {
   collectCodexSessionTurns,
+  collectCodexSessionTurnsInChild,
   collectCcSwitchTurns,
   ccSwitchStatus,
   isLoopbackHost,
+  parseArgs,
   runPython,
   startServer,
 };
 
-if (require.main === module) startServer(parseArgs(process.argv.slice(2)));
+if (require.main === module) {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.collectCodexSessions) {
+    collectCodexSessionTurns(options)
+      .then((payload) => process.stdout.write(JSON.stringify(payload)))
+      .catch((error) => {
+        console.error(error?.message || String(error));
+        process.exitCode = 1;
+      });
+  } else {
+    startServer(options);
+  }
+}

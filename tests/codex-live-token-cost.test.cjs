@@ -4,9 +4,7 @@ const vm = require("node:vm");
 const assert = require("node:assert/strict");
 
 const scriptPath = path.join(__dirname, "..", "scripts", "codex-live-token-cost.js");
-const priceSourcePath = path.join(__dirname, "..", "scripts", "codex-live-token-cost-prices.js");
 const code = fs.readFileSync(scriptPath, "utf8").replace(/\r\n/g, "\n");
-const priceSourceCode = fs.readFileSync(priceSourcePath, "utf8").replace(/\r\n/g, "\n");
 
 function createIndexedDbTestDouble() {
   const databases = new Map();
@@ -41,6 +39,14 @@ function createIndexedDbTestDouble() {
             schedule(() => {
               store.rows.set(String(value[store.keyPath]), clone(value));
               request.result = value;
+              request.onsuccess?.({ target: request });
+            });
+            return request;
+          },
+          delete(key) {
+            const request = { result: undefined, onsuccess: null, onerror: null };
+            schedule(() => {
+              store.rows.delete(String(key));
               request.onsuccess?.({ target: request });
             });
             return request;
@@ -420,8 +426,6 @@ assert.equal(code.includes('"gpt-5.4-pro"'), true);
 assert.equal(code.includes('"gpt-5.6-sol"'), true);
 assert.equal(code.includes('"gpt-5.6-terra"'), true);
 assert.equal(code.includes('"gpt-5.6-luna"'), true);
-assert.equal(priceSourceCode.includes('"gpt-5.6-sol"'), true);
-assert.equal(priceSourceCode.includes('"gpt-5.4-nano"'), true);
 assert.equal(code.includes('data-price-field="cacheWrite"'), true);
 assert.equal(code.includes("<span>写缓存</span>"), true);
 assert.equal(code.includes('{ value: "free", label: "Free" }'), true);
@@ -754,9 +758,7 @@ const context = {
 context.window = context;
 context.globalThis = context;
 context.__CODEX_LIVE_TOKEN_COST_TEST__ = true;
-
-vm.runInNewContext(priceSourceCode, context, { filename: priceSourcePath });
-context.__CODEX_LIVE_TOKEN_COST_PRICES__["gpt-test-data-source"] = { input: 9, cachedInput: 0.9, output: 90 };
+const originalElectronBridgeDescriptor = Object.getOwnPropertyDescriptor(context, "electronBridge");
 
 vm.runInNewContext(code, context, { filename: scriptPath });
 
@@ -775,6 +777,7 @@ assert.equal(typeof api.patchProfilePhotoUploadClient, "function");
 assert.equal(typeof api.codexAppAssetUrl, "function");
 assert.equal(typeof api.spoofProfileAuthContextValue, "function");
 assert.equal(typeof api.patchProfileReactAuthContext, "function");
+assert.equal(typeof api.requestBody, "function");
 assert.equal(typeof api.profileAuthContextFromFiberNode, "function");
 assert.equal(typeof api.profileAuthContextFromDocument, "function");
 assert.equal(typeof api.installLocalMessageCapture, "function");
@@ -800,6 +803,9 @@ assert.equal(api.countsTowardProfileFastMode({ source: "codex-live-token-cost", 
 assert.equal(typeof api.isComposerDraftPayload, "function");
 assert.equal(typeof api.profileLedgerUpsertTurn, "function");
 assert.equal(typeof api.profileLedgerObserveLocalTurn, "function");
+assert.equal(typeof api.profileRollupDaysForTurn, "function");
+assert.equal(typeof api.localProfileDailyUsageBuckets, "function");
+assert.equal(typeof api.localProfileStreakStats, "function");
 
 const hydratedTurnIndex = api.profileLedgerRebuildTurnIndex(
   api.profileNormalizeSnapshot({
@@ -1006,12 +1012,12 @@ assert.equal(typeof api.analyticsChartBuckets, "function");
 assert.equal(typeof api.refreshUsageAnalyticsFromHelper, "function");
 assert.equal(typeof api.localProfileAccountsCheckResponse, "function");
 assert.equal(typeof api.profileUiAuthContextValue, "function");
-const dataSourcePrice = api.priceFor("gpt-test-data-source");
-assert.equal(dataSourcePrice.input, 9);
-assert.equal(dataSourcePrice.cachedInput, 0.9);
-assert.equal(dataSourcePrice.output, 90);
-assert.equal(api.visiblePrices()["gpt-test-data-source"].output, 90);
-assert.equal(api.priceModelKey("GPT-TEST-DATA-SOURCE"), "gpt-test-data-source");
+const defaultPrice = api.priceFor("gpt-5.6-sol");
+assert.equal(defaultPrice.input, 5);
+assert.equal(defaultPrice.cachedInput, 0.5);
+assert.equal(defaultPrice.output, 30);
+assert.equal(api.visiblePrices()["gpt-5.6-sol"].output, 30);
+assert.equal(api.priceModelKey("GPT-5.6-SOL"), "gpt-5.6-sol");
 assert.equal(api.currentSessionKey().startsWith("new:startup:"), true);
 assert.equal(api.currentSessionTurns(api.localUsageExport().turns).length, 0);
 assert.equal(api.liveSnapshot().session.total, 0);
@@ -1024,6 +1030,11 @@ assert.equal(api.rollTrend("$2.00", "$1.00"), "down");
 assert.equal(api.rollTrend("high", "low"), "same");
 const localBoundaryTime = new Date(2026, 6, 11, 0, 30, 0, 0).getTime();
 assert.equal(api.localDateKey(localBoundaryTime), "2026-07-11");
+const beforeProfileLocalDateBoundary = currentNow;
+currentNow = Date.parse("2026-07-04T16:30:00.000Z");
+assert.equal(api.localProfileDailyUsageBuckets([]).at(-1).start_date, "2026-07-05");
+assert.equal(JSON.stringify(api.localProfileStreakStats([{ date: "2026-07-05", tokens: 1 }])), JSON.stringify({ current: 1, longest: 1 }));
+currentNow = beforeProfileLocalDateBoundary;
 const todayRange = api.analyticsRangeForPreset("today", localBoundaryTime);
 assert.equal(todayRange.startMs, new Date(2026, 6, 11, 0, 0, 0, 0).getTime());
 assert.equal(todayRange.endMs, localBoundaryTime);
@@ -1079,6 +1090,7 @@ assert.equal(analytics.cacheWriteAvailable, true);
 assert.equal(analytics.regularInput, 70);
 assert.equal(analytics.cacheHitRate, Math.round((46 / 130) * 100));
 assert.equal(analytics.priced, false);
+assert.equal(analytics.estimatedCost, true);
 assert.equal(analytics.models.length, 2);
 assert.equal(analytics.models.find((item) => item.model === "unknown-test-model").priced, false);
 const futureDatedCcDayAggregate = api.aggregateUsageAnalytics(
@@ -1108,6 +1120,7 @@ assert.equal(analyticsRollup.days["2026-07-11"].models["unknown-test-model"].usa
 const analyticsRollupTurns = api.analyticsTurnsFromRollup(analyticsRollup);
 assert.equal(analyticsRollupTurns.length, 2);
 assert.equal(analyticsRollupTurns.find((turn) => turn.model === "gpt-5.6-sol").callCount, 4);
+assert.equal(analyticsRollupTurns.find((turn) => turn.model === "gpt-5.6-sol").timeGranularity, "day");
 assert.equal(api.saveAnalyticsRollup(analyticsRollup), true);
 assert.equal(api.loadAnalyticsRollup().days["2026-07-11"].models["unknown-test-model"].calls, 2);
 const cappedLedger = api.trimLocalLedger(
@@ -1186,8 +1199,48 @@ const dailyOnlyBuckets = api.analyticsChartBuckets(
   { startMs: new Date(2026, 6, 11, 0, 0).getTime(), endMs: new Date(2026, 6, 11, 23, 59, 59, 999).getTime() },
   "tokens",
 );
-assert.equal(dailyOnlyBuckets.length, 24);
+assert.equal(dailyOnlyBuckets.length, 1);
+assert.equal(dailyOnlyBuckets[0].key, "day:2026-07-11");
 assert.equal(dailyOnlyBuckets[0].value, 55);
+const dailyAggregateHtml = api.usageAnalyticsHtml({
+  now: new Date(2026, 6, 11, 15, 0).getTime(),
+  preset: "today",
+  turns: [
+    {
+      turnId: "daily-aggregate-label",
+      source: "analytics-rollup",
+      timeGranularity: "day",
+      createdAt: new Date(2026, 6, 11, 12, 0).toISOString(),
+      model: "gpt-5.5",
+      usage: { input: 50, output: 5, cached: 20, total: 55, exact: true },
+    },
+  ],
+});
+assert.equal(dailyAggregateHtml.includes("按日（含汇总）"), true);
+const mixedGranularityBuckets = api.analyticsChartBuckets(
+  [
+    {
+      turnId: "hourly-usage",
+      source: "codex-live-token-cost",
+      createdAt: new Date(2026, 6, 11, 13, 0).toISOString(),
+      model: "gpt-5.5",
+      usage: { input: 10, output: 2, cached: 0, total: 12, exact: true },
+    },
+    {
+      turnId: "daily-archive",
+      source: "analytics-rollup",
+      timeGranularity: "day",
+      createdAt: new Date(2026, 6, 11, 12, 0).toISOString(),
+      model: "gpt-5.5",
+      usage: { input: 20, output: 3, cached: 0, total: 23, exact: true },
+    },
+  ],
+  { startMs: new Date(2026, 6, 11, 0, 0).getTime(), endMs: new Date(2026, 6, 11, 23, 59, 59, 999).getTime() },
+  "tokens",
+);
+assert.equal(mixedGranularityBuckets.length, 1);
+assert.equal(mixedGranularityBuckets[0].key, "day:2026-07-11");
+assert.equal(mixedGranularityBuckets[0].value, 35);
 const weeklyBuckets = api.analyticsChartBuckets(
   [],
   { startMs: new Date(2026, 0, 1).getTime(), endMs: new Date(2026, 3, 30, 23, 59, 59, 999).getTime() },
@@ -1202,8 +1255,8 @@ const analyticsHtml = api.usageAnalyticsHtml({
 assert.equal(analyticsHtml.includes("<h2>使用统计</h2>"), true);
 assert.equal(analyticsHtml.includes('data-analytics-preset="today"'), true);
 assert.equal(analyticsHtml.includes("总 Token"), true);
-assert.equal(analyticsHtml.includes("总花费"), true);
-assert.equal(analyticsHtml.includes("模型调用"), true);
+assert.equal(analyticsHtml.includes("费用估算"), true);
+assert.equal(analyticsHtml.includes("计量记录"), true);
 assert.equal(analyticsHtml.includes("缓存命中率"), true);
 assert.equal(analyticsHtml.includes('data-analytics-chart="true"'), true);
 assert.equal(analyticsHtml.includes("cltc-analytics-tooltip"), true);
@@ -2039,8 +2092,6 @@ assert.equal(gpt54FastCost.value, gpt54StandardCost.value * 2);
 const gpt54MiniStandardCost = api.costForModelUsage(baseFastUsage, "gpt-5.4-mini");
 const gpt54MiniFastCost = api.costForModelUsage(baseFastUsage, "gpt-5.4-mini", { fastMode: true });
 assert.equal(gpt54MiniFastCost.value, gpt54MiniStandardCost.value * 2);
-const dataSourceFastCost = api.costForModelUsage(baseFastUsage, "gpt-test-data-source", { fastMode: true });
-assert.equal(dataSourceFastCost.value, api.costForModelUsage(baseFastUsage, "gpt-test-data-source").value);
 assert.equal(api.isCodexPlusText("Codex++"), true);
 assert.equal(api.isCodexPlusText("Codex Token Cost 设置"), false);
 context.electronBridge.sendMessageFromView({ type: "fetch", method: "GET", url: "/wham/profiles/me", requestId: "profile-1" });
@@ -2109,6 +2160,8 @@ const rawApiAuth = {
 };
 authContext._currentValue = rawApiAuth;
 authContext._currentValue2 = rawApiAuth;
+const authContextValueDescriptor = Object.getOwnPropertyDescriptor(authContext, "_currentValue");
+const authContextValue2Descriptor = Object.getOwnPropertyDescriptor(authContext, "_currentValue2");
 const capturedUseContext = (context) => context._currentValue;
 const authDependency = { context: authContext, memoizedValue: rawApiAuth, next: null };
 const profileButton = {
@@ -2640,6 +2693,25 @@ assert.equal(importedDay.tokens, 120);
 assert.equal(importedDay.requests, 3);
 assert.equal(importedDay.cost, 1.23);
 assert.equal(importedProfile.stats.longest_running_turn_sec, 0);
+api.importLocalUsageTurns(
+  [
+    {
+      turnId: "session-duration-turn",
+      sessionKey: "session-duration-thread",
+      source: "codex-session",
+      importSource: "codex-session",
+      model: "gpt-5.6-sol",
+      createdAt: "2026-06-02T12:00:00.000Z",
+      startedAt: "2026-06-02T12:00:00.000Z",
+      finishedAt: "2026-06-02T12:01:30.000Z",
+      durationMs: 90000,
+      durationStatus: "completed",
+      usage: { input: 10, output: 2, cached: 4, total: 12 },
+    },
+  ],
+  { replaceSource: "codex-session" },
+);
+assert.equal(api.localProfileResponse().stats.longest_running_turn_sec, 90);
 const ccSwitchDedupeDay = importedProfile.stats.daily_usage_buckets.find((day) => day.start_date === "2026-06-15");
 assert.equal(ccSwitchDedupeDay.tokens, 5500);
 assert.equal(ccSwitchDedupeDay.input_tokens, 4000);
@@ -3657,6 +3729,7 @@ const photoClient = {
     throw new Error("Unauthorized");
   },
 };
+const originalPhotoPost = photoClient.post;
 assert.equal(api.patchProfilePhotoUploadClient(photoClient), true);
 const functionPhotoClient = function functionPhotoClient() {};
 functionPhotoClient.post = photoClient.post;
@@ -4218,8 +4291,26 @@ const profileClient = {
     throw new Error("Unauthorized");
   },
 };
+const originalProfileSafeGet = profileClient.safeGet;
+const originalProfileSafePatch = profileClient.safePatch;
+const statsigClient = {
+  checkGate(name) {
+    return this === statsigClient && name === "native-gate";
+  },
+  getFeatureGate(name) {
+    return { value: false, name, owner: this };
+  },
+  $emt() {},
+};
+const originalStatsigCheckGate = statsigClient.checkGate;
+const originalStatsigGetFeatureGate = statsigClient.getFeatureGate;
+context.__STATSIG__ = { firstInstance: statsigClient };
 assert.equal(api.patchProfileRequestClient(profileClient), true);
-api.saveProfileUnlockEnabled(true);
+api.setProfileUnlockEnabled(true);
+assert.equal(statsigClient.checkGate("2478676115"), true);
+assert.equal(statsigClient.checkGate("native-gate"), true);
+assert.strictEqual(statsigClient.getFeatureGate("2478676115").owner, statsigClient);
+assert.equal(statsigClient.getFeatureGate("2478676115").value, true);
 const syntheticProfileAuth = api.profileUiAuthContextValue({
   authMethod: "apikey",
   account: { id: "api-account", type: "apiKey", planType: "api" },
@@ -4384,7 +4475,8 @@ const profileLifecycleTest = Promise.resolve()
   .then((patchedGet) => {
     const helperBridgeUrls = bridgeCalls.map((message) => String(message.url || "")).filter(Boolean);
     assert.equal(helperBridgeUrls.some((url) => url === "http://127.0.0.1:17888/stats?refresh=1"), false);
-    assert.equal(helperBridgeUrls.some((url) => url === "http://127.0.0.1:17888/cc-switch/turns?refresh=1"), true);
+    assert.equal(helperBridgeUrls.some((url) => url === "http://127.0.0.1:17888/cc-switch/turns?refresh=1"), false);
+    assert.equal(helperBridgeUrls.some((url) => url === "http://127.0.0.1:17888/cc-switch/turns"), true);
     assert.equal(patchedGet.stats.unique_skills_used, 2);
     assert.equal(patchedGet.stats.total_skills_used, 2);
     assert.equal(
@@ -4422,12 +4514,42 @@ const profileLifecycleTest = Promise.resolve()
     assert.equal(typeof localMessageHandler, "function");
     assert.equal((windowListeners.get("message") || []).length, messageListenersBeforeLocalCapture + 1);
 assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.9");
+    api.finishLocalTurn(0, { reason: "helper-message-isolation-reset", force: true });
+    api.beginLocalTurn({ forceNewIfUsed: true });
+    api.rememberLocalUsage({ input_tokens: 10, output_tokens: 1, total_tokens: 11 }, "websocket");
+    const usageBeforeHelperMessage = api.localUsageExport().currentTurn.usage.total;
+    localMessageHandler({
+      data: {
+        type: "fetch-response",
+        requestId: "cltc-helper-test",
+        responseType: "success",
+        status: 200,
+        bodyJsonString: JSON.stringify({ ok: true, turns: [{ usage: { input: 900, output: 100, total: 1000 } }] }),
+      },
+    });
+    assert.equal(api.localUsageExport().currentTurn.usage.total, usageBeforeHelperMessage);
+    api.finishLocalTurn(0, { reason: "helper-message-isolation-cleanup", force: true });
     context.document.getElementById = () => null;
     context.__codexLiveTokenCost.destroy();
     assert.equal((windowListeners.get("message") || []).includes(localMessageHandler), false);
     assert.equal(context.__codexLiveTokenCostMessageCapture, undefined);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(authContext, "_currentValue"), authContextValueDescriptor);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(authContext, "_currentValue2"), authContextValue2Descriptor);
+    assert.strictEqual(photoClient.post, originalPhotoPost);
+    assert.strictEqual(profileClient.safeGet, originalProfileSafeGet);
+    assert.strictEqual(profileClient.safePatch, originalProfileSafePatch);
+    assert.strictEqual(statsigClient.checkGate, originalStatsigCheckGate);
+    assert.strictEqual(statsigClient.getFeatureGate, originalStatsigGetFeatureGate);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(context, "electronBridge"), originalElectronBridgeDescriptor);
   })
   .then(async () => {
+    const requestBodyFromRequest = await api.requestBody({
+      clone() {
+        return { text: async () => '{"display_name":"Request Body"}' };
+      },
+    });
+    assert.equal(requestBodyFromRequest, '{"display_name":"Request Body"}');
+
     const originalLocation = context.location;
     const originalBridge = context.electronBridge;
     const originalFetch = context.fetch;
@@ -4478,6 +4600,61 @@ assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.9");
     assert.equal(profileRefreshCalls.filter((url) => url.endsWith("/cc-switch/turns")).length, 1);
     assert.equal(api.localProfileResponse().stats.unique_skills_used, 2);
     assert.equal(api.localProfileResponse().stats.total_skills_used, 2);
+
+    const codexSessionSyncCalls = [];
+    context.fetch = async function codexSessionSyncFetch(url) {
+      codexSessionSyncCalls.push(String(url));
+      return { ok: true, async json() { return { ok: true, refreshing: false, turns: [] }; } };
+    };
+    const firstCodexSessionSync = await api.syncCodexSessionUsageFromHelper();
+    const throttledCodexSessionSync = await api.syncCodexSessionUsageFromHelper();
+    assert.equal(firstCodexSessionSync.ok, true);
+    assert.equal(throttledCodexSessionSync.skipped, true);
+    assert.equal(codexSessionSyncCalls.length, 1);
+    await api.syncCodexSessionUsageFromHelper({ refresh: true });
+    assert.equal(codexSessionSyncCalls.length, 2);
+    assert.equal(codexSessionSyncCalls[1].endsWith("/codex-sessions/turns?refresh=1"), true);
+
+    currentNow += 121000;
+    let releaseOrdinarySessionSync;
+    context.fetch = function deferredCodexSessionSyncFetch(url) {
+      codexSessionSyncCalls.push(String(url));
+      if (!releaseOrdinarySessionSync) {
+        return new Promise((resolve) => {
+          releaseOrdinarySessionSync = () => resolve({ ok: true, async json() { return { ok: true, refreshing: false, turns: [] }; } });
+        });
+      }
+      return Promise.resolve({ ok: true, async json() { return { ok: true, refreshing: false, turns: [] }; } });
+    };
+    const ordinarySessionSync = api.syncCodexSessionUsageFromHelper();
+    const forcedSessionSync = api.syncCodexSessionUsageFromHelper({ refresh: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(codexSessionSyncCalls.length, 3);
+    releaseOrdinarySessionSync();
+    await Promise.all([ordinarySessionSync, forcedSessionSync]);
+    assert.equal(codexSessionSyncCalls.length, 4);
+    assert.equal(codexSessionSyncCalls[3].endsWith("/codex-sessions/turns?refresh=1"), true);
+
+    currentNow += 121000;
+    const overlappingProfileCalls = [];
+    let releaseOrdinaryProfileRefresh;
+    context.fetch = function deferredProfileRefreshFetch(url) {
+      overlappingProfileCalls.push(String(url));
+      if (!releaseOrdinaryProfileRefresh) {
+        return new Promise((resolve) => {
+          releaseOrdinaryProfileRefresh = () => resolve({ ok: true, async json() { return { ok: true, refreshing: false, turns: [] }; } });
+        });
+      }
+      return Promise.resolve({ ok: true, async json() { return { ok: true, refreshing: false, turns: [] }; } });
+    };
+    const ordinaryProfileRefresh = api.refreshProfileData();
+    const forcedProfileRefresh = api.refreshProfileData({ force: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(overlappingProfileCalls.length, 1);
+    releaseOrdinaryProfileRefresh();
+    await Promise.all([ordinaryProfileRefresh, forcedProfileRefresh]);
+    assert.equal(overlappingProfileCalls.some((url) => url.endsWith("/cc-switch/turns?refresh=1")), true);
+    assert.equal(overlappingProfileCalls.some((url) => url.endsWith("/codex-sessions/turns?refresh=1")), true);
 
     context.location = originalLocation;
     context.fetch = async function blockedAppFetch(url) {
@@ -4622,6 +4799,9 @@ profileLifecycleTest.then(async () => {
   const multiCallDay = multiCallProfile.stats.daily_usage_buckets.find((day) => day.start_date === "2026-07-20");
   assert.equal(multiCallDay.tokens, 330);
   assert.equal(multiCallDay.requests, 2);
+  const multiCallRollupDays = api.profileRollupDaysForTurn(api.profileLedgerTurns().find((turn) => turn.turnId === "profile-ledger-multi-call-turn"));
+  assert.equal(multiCallRollupDays.length, 1);
+  assert.equal(multiCallRollupDays[0].date, "2026-07-20");
   assert.equal(api.rememberLocalUsage(multiCallFirst, "websocket", {}, { sessionKey: multiCallSession, persist: true }), false);
   assert.equal(api.localProfileResponse().stats.daily_usage_buckets.find((day) => day.start_date === "2026-07-20").tokens, 330);
   api.finishLocalTurn(0, { reason: "profile-ledger-multi-call-complete", force: true, sessionKey: multiCallSession });
@@ -4955,11 +5135,33 @@ profileLifecycleTest.then(async () => {
   );
   idbApi.finishLocalTurn(0, { reason: "idb-roundtrip-complete", force: true, sessionKey: "idb-roundtrip-thread" });
   for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  idbApi.profileLedgerUpsertTurn({
+    turnId: "idb-cross-day-turn",
+    source: "codex-live-token-cost",
+    startedAt: "2026-07-19T12:00:00.000+08:00",
+    usage: { input: 7, output: 0, total: 7 },
+    fastMode: true,
+  });
+  idbApi.profileLedgerUpsertTurn({
+    turnId: "idb-cross-day-turn",
+    source: "codex-live-token-cost",
+    startedAt: "2026-07-20T12:00:00.000+08:00",
+    usage: { input: 7, output: 0, total: 7 },
+    fastMode: true,
+  });
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
   const idbDatabase = await new Promise((resolve, reject) => {
     const request = context.indexedDB.open("codex-live-token-cost-profile");
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+  const persistedDailyRollups = await new Promise((resolve, reject) => {
+    const request = idbDatabase.transaction("profileDailyRollups", "readonly").objectStore("profileDailyRollups").getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  assert.equal(persistedDailyRollups.some((day) => day.date === "2026-07-19"), false);
+  assert.equal(persistedDailyRollups.find((day) => day.date === "2026-07-20")?.tokens, 49);
   await new Promise((resolve, reject) => {
     const request = idbDatabase.transaction("profileUsageCalls", "readwrite").objectStore("profileUsageCalls").put({
       id: "legacy-total-only-call",
@@ -4974,7 +5176,7 @@ profileLifecycleTest.then(async () => {
   idbDatabase.close();
   const persistedSnapshot = JSON.parse(storage.get("__codexLiveTokenCostProfileLedgerV2"));
   assert.equal(persistedSnapshot.storage, "indexeddb");
-  assert.equal(persistedSnapshot.rollup.days["2026-07-20"].tokens, 42);
+  assert.equal(persistedSnapshot.rollup.days["2026-07-20"].tokens, 49);
   storage.set(
     "__codexLiveTokenCostProfileLedgerV2",
     JSON.stringify({
@@ -5005,7 +5207,7 @@ profileLifecycleTest.then(async () => {
   assert.equal(beforeIdbHydration.stats.lifetime_tokens, 0);
   for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
   const afterIdbHydration = context.__codexLiveTokenCostTest.localProfileResponse();
-  assert.equal(afterIdbHydration.stats.lifetime_tokens, 42);
+  assert.equal(afterIdbHydration.stats.lifetime_tokens, 49);
   assert.equal(afterIdbHydration.stats.total_threads, 1);
   assert.equal(afterIdbHydration.stats.fast_mode_usage_percentage, 100);
   assert.equal(afterIdbHydration.stats.longest_running_turn_sec, 123);

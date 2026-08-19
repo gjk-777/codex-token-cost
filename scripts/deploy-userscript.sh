@@ -12,7 +12,12 @@ if [ ! -f "$SOURCE" ]; then
 fi
 
 mkdir -p "$TARGET_DIR"
-cp "$SOURCE" "$TARGET"
+TEMP="$(mktemp "$TARGET_DIR/.market-codex-live-token-cost.js.XXXXXX")"
+cleanup() {
+  rm -f "$TEMP"
+}
+trap cleanup EXIT
+cp "$SOURCE" "$TEMP"
 
 if command -v shasum >/dev/null 2>&1; then
   HASH_STYLE=shasum
@@ -32,6 +37,15 @@ sha256_file() {
 }
 
 SOURCE_HASH="$(sha256_file "$SOURCE")"
+TEMP_HASH="$(sha256_file "$TEMP")"
+
+if [ "$SOURCE_HASH" != "$TEMP_HASH" ]; then
+  echo "Temporary userscript hash does not match source" >&2
+  exit 1
+fi
+
+mv -f "$TEMP" "$TARGET"
+trap - EXIT
 TARGET_HASH="$(sha256_file "$TARGET")"
 
 MATCH=false
