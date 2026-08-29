@@ -27,9 +27,35 @@ function Test-HelperHealth {
   }
 }
 
+function Get-HelperProcesses {
+  Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match '[\\/]codex-local-usage-helper\.cjs(?:"|\s)' }
+}
+
+function Stop-OtherHelperProcesses {
+  param([int]$KeepProcessId = 0)
+
+  foreach ($helperProcess in @(Get-HelperProcesses)) {
+    if ($helperProcess.ProcessId -ne $KeepProcessId) {
+      Stop-Process -Id $helperProcess.ProcessId -Force -ErrorAction Stop
+    }
+  }
+}
+
 if (Test-HelperHealth) {
+  $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $_.LocalAddress -in @($ListenHost, "0.0.0.0", "::") } |
+    Select-Object -First 1
+  $keepProcessId = if ($listener) {
+    [int]$listener.OwningProcess
+  } else {
+    [int]((Get-HelperProcesses | Select-Object -First 1).ProcessId)
+  }
+  Stop-OtherHelperProcesses -KeepProcessId $keepProcessId
   return
 }
+
+Stop-OtherHelperProcesses
 
 $existing = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
   Where-Object { $_.LocalAddress -in @($ListenHost, "0.0.0.0", "::") } |

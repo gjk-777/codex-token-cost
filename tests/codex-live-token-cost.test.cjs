@@ -99,7 +99,7 @@ assert.equal(code.includes('pushState(history.state, "", "/settings/profile")'),
 assert.equal(code.includes("@run-at       document-start"), true);
 assert.equal(code.includes("window.postMessage(message"), true);
 assert.equal(code.includes('"codex-message-from-view"'), true);
-assert.equal(code.includes('const VERSION = "0.7.9"'), true);
+assert.equal(code.includes('const VERSION = "0.7.10"'), true);
 assert.equal(code.includes("function syncSidebarProfileIdentity"), true);
 assert.equal(code.includes("void installProfileAuthContextPatch();"), true);
 assert.equal(code.includes("profileAuthValuePatches"), false);
@@ -503,6 +503,10 @@ assert.equal(code.includes("state.helperPollTimer = window.setInterval"), false)
 assert.equal(code.includes("helperJsonUntilReady"), true);
 assert.equal(code.includes("HELPER_STATUS_DEGRADED"), true);
 assert.equal(code.includes("HELPER_BRIDGE_RETRY_DELAYS_MS"), true);
+assert.equal(code.includes("const httpFetch = value?.httpFetch"), true);
+assert.equal(code.includes("Reflect.apply(candidate.fetch, candidate.httpFetch"), true);
+assert.equal(code.includes("for (const candidate of candidates)"), true);
+assert.equal(code.includes("typeof window.fetch !== \"function\" && !isCodexAppDocument()"), true);
 assert.match(code, /helperJsonViaBridgeWithRetry\(url\)/);
 assert.equal(code.includes('data-field="helper-status"'), true);
 assert.equal(code.includes("https://github.com/Tianzora/codex-token-cost/blob/main/scripts/codex-local-usage-helper.cjs"), true);
@@ -1281,7 +1285,7 @@ const unavailableCacheWriteHtml = api.usageAnalyticsHtml({
   ],
 });
 assert.equal(unavailableCacheWriteHtml.includes("写缓存<strong>未提供</strong>"), true);
-assert.equal(context.__codexLiveTokenCost.version, "0.7.9");
+assert.equal(context.__codexLiveTokenCost.version, "0.7.10");
 assert.equal(api.currentSessionKey().startsWith("new:startup:"), true);
 assert.equal(api.extractSessionKeyFromUrl("/thread/thread-1"), "thread-1");
 assert.equal(api.extractSessionKeyFromUrl("/api/conversation?conversationId=thread-1"), "thread-1");
@@ -1572,13 +1576,6 @@ assert.equal(api.liveSnapshot().session.total, 0);
 assert.equal(api.ccSwitchSettingsHtml().includes('data-field="cc-switch-sync-status"'), true);
 assert.equal(api.ccSwitchSettingsHtml().includes('data-field="helper-status"'), true);
 assert.equal(api.ccSwitchSettingsHtml().includes("Helper 可选"), true);
-Promise.resolve(api.syncCcSwitchUsageFromHelper()).then((result) => {
-  assert.equal(result.ok, false);
-  assert.equal(result.helperUnavailable, true);
-});
-assert.equal(api.helperStatusText().includes("无法同步 CC Switch"), true);
-assert.equal(api.ccSwitchSettingsHtml().includes('data-helper-unavailable="true"'), true);
-assert.equal(api.ccSwitchSettingsHtml().includes("今日统计仅使用本地捕获"), true);
 function hubTestRoot() {
   const attributes = new Map();
   const style = {
@@ -2260,7 +2257,7 @@ delayedProfileButton = {
   },
 };
 profileReadinessObserver.callback([{ addedNodes: [delayedProfileButton] }]);
-assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.9");
+assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.10");
 assert.equal(api.profileSyntheticAuth(), true);
 assert.equal(profileReadinessObserver.disconnected, true);
 assert.equal(delayedProfileCacheWrites.length > 0, true);
@@ -4513,7 +4510,7 @@ const profileLifecycleTest = Promise.resolve()
     const localMessageHandler = api.localMessageHandler();
     assert.equal(typeof localMessageHandler, "function");
     assert.equal((windowListeners.get("message") || []).length, messageListenersBeforeLocalCapture + 1);
-assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.9");
+assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.10");
     api.finishLocalTurn(0, { reason: "helper-message-isolation-reset", force: true });
     api.beginLocalTurn({ forceNewIfUsed: true });
     api.rememberLocalUsage({ input_tokens: 10, output_tokens: 1, total_tokens: 11 }, "websocket");

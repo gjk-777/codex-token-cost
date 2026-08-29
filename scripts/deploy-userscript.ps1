@@ -9,6 +9,9 @@ if (-not $env:APPDATA) {
 $source = Join-Path $PSScriptRoot "codex-live-token-cost.js"
 $targetDir = Join-Path $env:APPDATA "Codex++\user_scripts"
 $target = Join-Path $targetDir "market-codex-live-token-cost.js"
+$legacyTargets = @(
+  (Join-Path $targetDir "market-codex-token-usage.js")
+)
 
 if (-not (Test-Path -LiteralPath $source)) {
   throw "Source script not found: $source"
@@ -51,4 +54,11 @@ Write-Output "match=$($matched.ToString().ToLowerInvariant())"
 
 if (-not $matched) {
   exit 1
+}
+
+foreach ($legacyTarget in $legacyTargets) {
+  if (Test-Path -LiteralPath $legacyTarget) {
+    Remove-Item -LiteralPath $legacyTarget -Force
+    Write-Output "removed_legacy=$legacyTarget"
+  }
 }

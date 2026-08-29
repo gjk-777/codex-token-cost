@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.7.9
+// @version      0.7.10
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.7.9";
+const VERSION = "0.7.10";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -9782,6 +9782,42 @@ const VERSION = "0.7.9";
     throw lastError || new Error("helper bridge unavailable");
   }
 
+  async function helperJsonViaHttpService(url) {
+    const module = await loadCodexAppModule("app-initial-");
+    const candidates = [];
+    for (const [key, value] of Object.entries(module || {})) {
+      try {
+        const httpFetch = value?.httpFetch;
+        const fetch = httpFetch?.fetch;
+        if (typeof fetch === "function") {
+          candidates.push({ key, httpFetch, fetch });
+        }
+      } catch {
+        // Some bundled exports expose lazy getters that can throw or change between reads.
+      }
+    }
+    if (!candidates.length) throw new Error("Codex HTTP fetch service unavailable");
+    let lastError = null;
+    for (const candidate of candidates) {
+      const requestId = `cltc-http-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      let operation;
+      try {
+        operation = Reflect.apply(candidate.fetch, candidate.httpFetch, [requestId, { url, method: "GET", headers: {} }, {}]);
+        const result = await operation;
+        const response = result?.response;
+        if (!response) throw new Error("Codex HTTP fetch returned no response");
+        if (!response.ok) throw new Error(`helper fetch failed: ${response.status || 0}`);
+        return JSON.parse(await response.text());
+      } catch (error) {
+        lastError = error;
+      } finally {
+        try { operation?.[Symbol.dispose]?.(); } catch {}
+        try { await candidate.httpFetch?.cancel?.(requestId); } catch {}
+      }
+    }
+    throw lastError || new Error("Codex HTTP fetch service unavailable");
+  }
+
   function isCodexAppDocument() {
     const protocol = String(window.location?.protocol || "").toLowerCase();
     const href = String(window.location?.href || "").toLowerCase();
@@ -9789,6 +9825,17 @@ const VERSION = "0.7.9";
   }
 
   async function helperJson(url) {
+    if (isCodexAppDocument() && !window.__CODEX_LIVE_TOKEN_COST_TEST__) {
+      try {
+        return await helperJsonViaHttpService(url);
+      } catch (serviceError) {
+        try {
+          return await helperJsonViaBridgeWithRetry(url);
+        } catch {
+          throw new Error(serviceError?.message || "Codex HTTP fetch service unavailable");
+        }
+      }
+    }
     try {
       return await helperJsonViaBridgeWithRetry(url);
     } catch (error) {
@@ -9830,7 +9877,7 @@ const VERSION = "0.7.9";
       if (inFlightPromise) await inFlightPromise;
       if (state.ccSwitchSyncInFlight) return { ok: false, skipped: true, refreshing: true };
     }
-    if (typeof window.fetch !== "function") {
+    if (typeof window.fetch !== "function" && !isCodexAppDocument()) {
       setHelperStatus(HELPER_STATUS_CC_SWITCH_DEGRADED, true);
       return { ok: false, skipped: true, helperUnavailable: true };
     }
@@ -9875,7 +9922,7 @@ const VERSION = "0.7.9";
       if (inFlightPromise) await inFlightPromise;
       if (state.codexSessionSyncInFlight) return { ok: false, skipped: true, refreshing: true };
     }
-    if (typeof window.fetch !== "function") return { ok: false, skipped: true, helperUnavailable: true };
+    if (typeof window.fetch !== "function" && !isCodexAppDocument()) return { ok: false, skipped: true, helperUnavailable: true };
     const syncedAt = toCount(state.codexSessionSyncAt);
     if (!options.refresh && syncedAt && Date.now() - syncedAt < CODEX_SESSION_SYNC_MIN_INTERVAL_MS) {
       return { ok: true, skipped: true, cached: true, source: "codex-session" };
@@ -9939,7 +9986,7 @@ const VERSION = "0.7.9";
   }
 
   function startCcSwitchStartupSync() {
-    if (window.__CODEX_LIVE_TOKEN_COST_TEST__ || state.ccSwitchStartupSyncStarted || typeof window.fetch !== "function") return;
+    if (window.__CODEX_LIVE_TOKEN_COST_TEST__ || state.ccSwitchStartupSyncStarted || (typeof window.fetch !== "function" && !isCodexAppDocument())) return;
     state.ccSwitchStartupSyncStarted = true;
     window.setTimeout(() => {
       void Promise.all([syncCcSwitchUsageFromHelper(), syncCodexSessionUsageFromHelper()]).then(([ccSwitch, codexSessions]) => {
